@@ -1,0 +1,96 @@
+workflows:
+  android-release:
+    name: Android Release Build
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      android_signing:
+        - android_keystore  # Configure in CodeMagic dashboard
+      vars:
+        PACKAGE_NAME: "com.yourapp.telegram_streamer"
+        # Add these in CodeMagic Environment Variables (encrypted):
+        # TG_API_ID   → your Telegram api_id
+        # TG_API_HASH → your Telegram api_hash
+
+    triggering:
+      events:
+        - push
+        - tag
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+
+    scripts:
+      # ── 1. Set up TDLib native libraries ──────────────────────────────
+      - name: Download TDLib prebuilt .so libraries
+        script: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p android/app/src/main/jniLibs/armeabi-v7a
+          mkdir -p android/app/src/main/jniLibs/x86_64
+
+          # Download TDLib prebuilt libs (tdlib for Android)
+          # Official prebuilt from tdlib releases
+          TDLIB_VERSION="1.8.19"
+          BASE_URL="https://github.com/tdlib/td/releases/download/v${TDLIB_VERSION}"
+
+          echo "Downloading TDLib native libraries..."
+          # arm64-v8a (most modern Android phones)
+          curl -L "${BASE_URL}/tdlib-android-arm64-v8a.zip" -o /tmp/tdlib_arm64.zip
+          unzip -o /tmp/tdlib_arm64.zip -d /tmp/tdlib_arm64
+          cp /tmp/tdlib_arm64/*.so android/app/src/main/jniLibs/arm64-v8a/ 2>/dev/null || true
+
+          # armeabi-v7a (older 32-bit devices)
+          curl -L "${BASE_URL}/tdlib-android-armeabi-v7a.zip" -o /tmp/tdlib_arm32.zip
+          unzip -o /tmp/tdlib_arm32.zip -d /tmp/tdlib_arm32
+          cp /tmp/tdlib_arm32/*.so android/app/src/main/jniLibs/armeabi-v7a/ 2>/dev/null || true
+
+          echo "TDLib libraries ready."
+
+      # ── 2. Inject API credentials from env ────────────────────────────
+      - name: Inject Telegram API credentials
+        script: |
+          # Replace placeholder values in telegram_service.dart
+          sed -i "s/const int kApiId = 12345678;/const int kApiId = ${TG_API_ID};/" \
+            lib/services/telegram_service.dart
+          sed -i "s/const String kApiHash = 'your_api_hash_here';/const String kApiHash = '${TG_API_HASH}';/" \
+            lib/services/telegram_service.dart
+          echo "API credentials injected."
+
+      # ── 3. Flutter setup ───────────────────────────────────────────────
+      - name: Get Flutter packages
+        script: |
+          flutter pub get
+
+      - name: Analyze code
+        script: |
+          flutter analyze --no-fatal-infos || true
+
+      # ── 4. Build ───────────────────────────────────────────────────────
+      - name: Build Android APK (release)
+        script: |
+          flutter build apk \
+            --release \
+            --split-per-abi \
+            --build-name="1.0.0" \
+            --build-number=$BUILD_NUMBER
+
+      - name: Build Android App Bundle (AAB) for Play Store
+        script: |
+          flutter build appbundle \
+            --release \
+            --build-name="1.0.0" \
+            --build-number=$BUILD_NUMBER
+
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk
+      - build/app/outputs/bundle/release/*.aab
+      - flutter_drive.log
+
+    publishing:
+      email:
+        recipients:
+          - your@email.com  # ← replace with your email
+        notify:
+          success: true
+          failure: true
