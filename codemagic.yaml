@@ -19,9 +19,9 @@ workflows:
 
     scripts:
       # ── 1. Inject API credentials ────────────────────────────────────────
-      # Note: The manual "Download TDLib .so libraries" step has been removed.
-      # The tdlib pub.dev package bundles and links native .so files
-      # automatically via its own android/build.gradle — no manual copy needed.
+      # NOTE: The manual "Download TDLib .so libraries" step has been removed.
+      # The tdlib: ^1.6.0 package on pub.dev bundles the Android native .so
+      # files and links them automatically via its own android/build.gradle.
       - name: Inject Telegram API credentials
         script: |
           sed -i "s/const int kApiId = 12345678;/const int kApiId = ${TG_API_ID};/" \
@@ -40,7 +40,7 @@ workflows:
           flutter analyze --no-fatal-infos || true
 
       # ── 3. Build ──────────────────────────────────────────────────────────
-      # Fixed: removed --debug flag from APK build (was contradicting release intent)
+      # Fixed: --debug flag removed from APK step (was contradicting --release)
       - name: Build Android APK (release)
         script: |
           flutter build apk \
