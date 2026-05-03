@@ -26,6 +26,6 @@ async def main():
     print(f"📁 File: {message.file.name}")
     print(f"📦 Size: {message.file.size / (1024*1024):.2f} MB")
 
-    await start_server(client, message)
+    start_server(client, message)
 
 asyncio.run(main())
