@@ -1,13 +1,10 @@
 from flask import Flask, Response, request
-import threading
 import webbrowser
 import os
 
 app = Flask(__name__)
 
 file_path = "temp_video.mp4"
-client = None
-message = None
 
 @app.route("/")
 def home():
@@ -53,24 +50,7 @@ def stream():
     return Response(generate(), status=206, headers=headers)
 
 
-def download_file():
-    print("⬇️ Downloading file...")
-    client.loop.run_until_complete(
-        client.download_media(message.document, file_path)
-    )
-    print("✅ Download complete")
-
-
-def start_server(cli, msg):
-    global client, message
-    client = cli
-    message = msg
-
-    # Start downloading in background
-    threading.Thread(target=download_file).start()
-
+def start_server():
     print("🚀 Server running at http://127.0.0.1:8000")
-
-    threading.Timer(2, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
-
+    webbrowser.open("http://127.0.0.1:8000")
     app.run(host="127.0.0.1", port=8000)
