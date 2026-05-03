@@ -1,0 +1,71 @@
+name: telegram_streamer
+description: Stream Telegram files without downloading.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Telegram TDLib wrapper
+  flutter_tdlib:
+    git:
+      url: https://github.com/dreampowder/flutter_tdlib.git
+      ref: main
+
+  # Video player
+  video_player: ^2.8.3
+  chewie: ^1.7.4
+
+  # Audio player
+  just_audio: ^0.9.36
+
+  # Local HTTP proxy server for streaming
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
+
+  # Secure storage for session
+  flutter_secure_storage: ^9.0.0
+
+  # State management
+  provider: ^6.1.1
+
+  # HTTP
+  http: ^1.2.0
+
+  # URL launcher
+  url_launcher: ^6.2.4
+
+  # Connectivity
+  connectivity_plus: ^5.0.2
+
+  # Loading indicators
+  shimmer: ^3.0.0
+
+  # Toast messages
+  fluttertoast: ^8.2.4
+
+  # File type detection
+  mime: ^1.0.5
+
+  # Path provider
+  path_provider: ^2.1.2
+
+  # Shared preferences
+  shared_preferences: ^2.2.2
+
+  # Cupertino icons
+  cupertino_icons: ^1.0.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
