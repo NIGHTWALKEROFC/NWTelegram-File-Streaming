@@ -1,17 +1,22 @@
 from flask import Flask, Response, request
-import webbrowser
+import asyncio
 import threading
+import webbrowser
 
 app = Flask(__name__)
 client = None
 message = None
+loop = None
 
 @app.route("/")
 def home():
     return """
     <html>
-    <body style="background:black;">
-    <video width="100%" controls autoplay>
+    <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="margin:0;background:black;">
+    <video style="width:100%;height:100%;" controls autoplay>
         <source src="/stream" type="video/mp4">
     </video>
     </body>
@@ -31,13 +36,24 @@ def stream():
 
     chunk_size = 1024 * 1024
 
-    def generate():
-        for chunk in client.iter_download(
+    async def async_gen():
+        async for chunk in client.iter_download(
             message.document,
             offset=start,
             request_size=chunk_size
         ):
             yield chunk
+
+    def generate():
+        agen = async_gen()
+        while True:
+            try:
+                chunk = asyncio.run_coroutine_threadsafe(
+                    agen.__anext__(), loop
+                ).result()
+                yield chunk
+            except StopAsyncIteration:
+                break
 
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -48,13 +64,13 @@ def stream():
     return Response(generate(), status=206, headers=headers)
 
 def start_server(cli, msg):
-    global client, message
+    global client, message, loop
     client = cli
     message = msg
+    loop = asyncio.get_event_loop()
 
     print("🚀 Server running at http://127.0.0.1:8000")
 
-    # Auto open browser
     threading.Timer(2, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
 
     app.run(host="127.0.0.1", port=8000)
