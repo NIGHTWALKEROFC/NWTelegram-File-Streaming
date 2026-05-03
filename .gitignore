@@ -1,0 +1,37 @@
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+*.iml
+
+# Android
+android/.gradle
+android/captures/
+android/local.properties
+android/key.properties
+android/app/src/main/jniLibs/
+
+# iOS (not used, included for completeness)
+ios/Flutter/flutter_export_environment.sh
+ios/Pods/
+ios/.symlinks/
+
+# IDE
+.idea/
+.vscode/
+*.suo
+*.user
+
+# Sensitive files — NEVER commit these
+.env
+.env.local
+*.keystore
+*.jks
+google-services.json
+
+# TDLib session data
+tdlib/
