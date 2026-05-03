@@ -68,12 +68,12 @@ workflows:
 
       # ── 4. Build ───────────────────────────────────────────────────────
       - name: Build Android APK (release)
-        script: |
-          flutter build apk \
-            --release \
-            --split-per-abi \
-            --build-name="1.0.0" \
-            --build-number=$BUILD_NUMBER
+  script: |
+    flutter build apk \
+      --debug \
+      --split-per-abi \
+      --build-name="1.0.0" \
+      --build-number=$BUILD_NUMBER
 
       - name: Build Android App Bundle (AAB) for Play Store
         script: |
