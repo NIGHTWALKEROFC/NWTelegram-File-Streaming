@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:tdlib/tdlib.dart'; // ← fixed: was flutter_tdlib
+import 'package:tdlib/tdlib.dart'; // tdlib: ^1.6.0  (i-Naji/tdlib on pub.dev)
 
 import '../models/telegram_file.dart';
 
@@ -27,7 +28,8 @@ enum AuthState {
 }
 
 class TelegramService extends ChangeNotifier {
-  TdClient? _client; // ← fixed: was TdPlugin
+  // tdlib 1.6.0: TdPlugin singleton + integer client ID
+  int? _clientId;
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
   AuthState _authState = AuthState.idle;
@@ -57,16 +59,18 @@ class TelegramService extends ChangeNotifier {
       final dbPath = '${dir.path}/tdlib';
       await Directory(dbPath).create(recursive: true);
 
-      _client = TdClient(); // ← fixed: was TdPlugin.instance
+      // tdlib 1.6.0: initialize the native plugin once, then allocate a client
+      await TdPlugin.initialize();
+      _clientId = TdPlugin.instance.tdCreateClientId();
       _isInitialized = true;
 
-      // Start listening for updates
+      // Start polling for updates
       _startUpdateListener();
 
       // Send TDLib parameters
       await _sendTdLibParams(dbPath);
 
-      // Wait for auth state
+      // Wait for first auth state update
       await _waitForInitialAuthState();
     } catch (e) {
       _errorMessage = 'Failed to initialize: $e';
@@ -76,12 +80,13 @@ class TelegramService extends ChangeNotifier {
   }
 
   void _startUpdateListener() {
-    // Poll TDLib every 100 ms for incoming updates
-    _receiveTimer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
-      if (_client == null) return;
+    // Poll TDLib every 100 ms on a timer.
+    // tdlib 1.6.0: tdReceive() is synchronous on TdPlugin.instance
+    _receiveTimer =
+        Timer.periodic(const Duration(milliseconds: 100), (_) {
+      if (_clientId == null) return;
       try {
-        // ← fixed: was tdReceive(); now async receive()
-        final response = await _client!.receive(0.1);
+        final response = TdPlugin.instance.tdReceive(0.1);
         if (response != null) {
           final Map<String, dynamic> update = json.decode(response);
           _updateController.add(update);
@@ -236,7 +241,6 @@ class TelegramService extends ChangeNotifier {
   // ──────────────────────────────────────────
   Future<TelegramFile?> resolveLink(String link) async {
     try {
-      // Step 1: Parse the link
       final linkInfo = await _sendRequest({
         '@type': 'getMessageLinkInfo',
         'url': link,
@@ -270,12 +274,10 @@ class TelegramService extends ChangeNotifier {
         final file = video['video'] as Map<String, dynamic>?;
         if (file == null) return null;
 
-        // Extract qualities from video
         final alternatives =
             video['alternative_videos'] as List<dynamic>? ?? [];
         final qualities = <VideoQuality>[];
 
-        // Main video quality
         final width = video['width'] as int? ?? 0;
         final height = video['height'] as int? ?? 0;
         qualities.add(VideoQuality(
@@ -287,7 +289,6 @@ class TelegramService extends ChangeNotifier {
           remoteId: (file['remote'] as Map?)?['id'] as String? ?? '',
         ));
 
-        // Alternative qualities
         for (final alt in alternatives) {
           final altMap = alt as Map<String, dynamic>;
           final altFile = altMap['video'] as Map<String, dynamic>?;
@@ -304,7 +305,6 @@ class TelegramService extends ChangeNotifier {
           ));
         }
 
-        // Sort descending by height
         qualities.sort((a, b) => b.height.compareTo(a.height));
 
         return TelegramFile(
@@ -414,8 +414,8 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Download file part for streaming
-  // Fixed: uses RandomAccessFile for true range reads instead of
-  // loading the entire file into memory (critical for large videos).
+  // Uses RandomAccessFile for true range reads — avoids loading
+  // the entire file into RAM per chunk (critical for large videos)
   // ──────────────────────────────────────────
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -440,8 +440,7 @@ class TelegramService extends ChangeNotifier {
       final file = File(localPath);
       if (!await file.exists()) return null;
 
-      // ← fixed: RandomAccessFile range read instead of readAsBytes()
-      // which previously loaded the entire file into memory for every chunk.
+      // RandomAccessFile for O(chunk) memory — not O(fileSize)
       final raf = await file.open();
       try {
         final fileLength = await raf.length();
@@ -476,11 +475,12 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Low-level TDLib request
+  // tdlib 1.6.0 API: tdSend(clientId, jsonString)
   // ──────────────────────────────────────────
   Future<Map<String, dynamic>?> _sendRequest(
     Map<String, dynamic> request,
   ) async {
-    if (_client == null) return null;
+    if (_clientId == null) return null;
 
     final String requestId = DateTime.now().millisecondsSinceEpoch.toString();
     request['@extra'] = requestId;
@@ -495,8 +495,8 @@ class TelegramService extends ChangeNotifier {
       }
     });
 
-    // ← fixed: was tdSend(); now send()
-    _client!.send(json.encode(request));
+    // tdlib 1.6.0: tdSend takes (clientId, jsonString)
+    TdPlugin.instance.tdSend(_clientId!, json.encode(request));
 
     return completer.future.timeout(
       const Duration(seconds: 30),
@@ -509,7 +509,7 @@ class TelegramService extends ChangeNotifier {
 
   @override
   void dispose() {
-    _receiveTimer?.cancel(); // ← fixed: cancel timer properly on dispose
+    _receiveTimer?.cancel();
     _updateController.close();
     super.dispose();
   }
