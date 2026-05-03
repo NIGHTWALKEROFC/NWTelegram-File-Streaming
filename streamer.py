@@ -4,6 +4,7 @@ import threading
 import webbrowser
 
 app = Flask(__name__)
+
 client = None
 message = None
 loop = None
@@ -17,7 +18,7 @@ def home():
     </head>
     <body style="margin:0;background:black;">
     <video style="width:100%;height:100%;" controls autoplay>
-        <source src="/stream" type="video/mp4">
+        <source src="/stream">
     </video>
     </body>
     </html>
@@ -34,26 +35,29 @@ def stream():
     if range_header:
         start = int(range_header.split("=")[1].split("-")[0])
 
-    chunk_size = 1024 * 1024
+    chunk_size = 1024 * 512  # smaller chunk = smoother
 
-    async def async_gen():
-        async for chunk in client.iter_download(
+    async def get_chunk(offset):
+        data = await client.download_file(
             message.document,
-            offset=start,
-            request_size=chunk_size
-        ):
-            yield chunk
+            offset=offset,
+            limit=chunk_size
+        )
+        return data
 
     def generate():
-        agen = async_gen()
-        while True:
-            try:
-                chunk = asyncio.run_coroutine_threadsafe(
-                    agen.__anext__(), loop
-                ).result()
-                yield chunk
-            except StopAsyncIteration:
+        current = start
+        while current <= end:
+            future = asyncio.run_coroutine_threadsafe(
+                get_chunk(current), loop
+            )
+            chunk = future.result()
+
+            if not chunk:
                 break
+
+            yield chunk
+            current += len(chunk)
 
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
