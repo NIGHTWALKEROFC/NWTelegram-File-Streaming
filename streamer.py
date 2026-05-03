@@ -1,14 +1,14 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
-import uvicorn
+from flask import Flask, Response, request
+import webbrowser
+import threading
 
-app = FastAPI()
+app = Flask(__name__)
 client = None
 message = None
 
-@app.get("/")
+@app.route("/")
 def home():
-    return HTMLResponse("""
+    return """
     <html>
     <body style="background:black;">
     <video width="100%" controls autoplay>
@@ -16,13 +16,13 @@ def home():
     </video>
     </body>
     </html>
-    """)
+    """
 
-@app.get("/stream")
-async def stream(request: Request):
+@app.route("/stream")
+def stream():
     file_size = message.file.size
+    range_header = request.headers.get("Range", None)
 
-    range_header = request.headers.get("range")
     start = 0
     end = file_size - 1
 
@@ -31,8 +31,8 @@ async def stream(request: Request):
 
     chunk_size = 1024 * 1024
 
-    async def file_iterator():
-        async for chunk in client.iter_download(
+    def generate():
+        for chunk in client.iter_download(
             message.document,
             offset=start,
             request_size=chunk_size
@@ -45,14 +45,16 @@ async def stream(request: Request):
         "Content-Type": "video/mp4",
     }
 
-    return StreamingResponse(file_iterator(), status_code=206, headers=headers)
+    return Response(generate(), status=206, headers=headers)
 
-async def start_server(cli, msg):
+def start_server(cli, msg):
     global client, message
     client = cli
     message = msg
 
-    print("🚀 Starting server at http://127.0.0.1:8000")
-    print("🌐 Open in browser...")
+    print("🚀 Server running at http://127.0.0.1:8000")
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Auto open browser
+    threading.Timer(2, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
+
+    app.run(host="127.0.0.1", port=8000)
