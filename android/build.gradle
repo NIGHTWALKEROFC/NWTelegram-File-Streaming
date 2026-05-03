@@ -1,8 +1,5 @@
 // Project-level build.gradle
-// All plugin declarations have been moved to settings.gradle
-// using the declarative pluginManagement + plugins {} blocks,
-// which is required by modern Flutter (Flutter 3.16+) and Gradle 8.x.
-// This file intentionally contains no buildscript {} block.
+// Plugin declarations live in settings.gradle — nothing needed here.
 
 allprojects {
     repositories {
