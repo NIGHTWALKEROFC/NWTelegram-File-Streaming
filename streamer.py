@@ -1,13 +1,13 @@
 from flask import Flask, Response, request
-import asyncio
 import threading
 import webbrowser
+import os
 
 app = Flask(__name__)
 
+file_path = "temp_video.mp4"
 client = None
 message = None
-loop = None
 
 @app.route("/")
 def home():
@@ -26,7 +26,7 @@ def home():
 
 @app.route("/stream")
 def stream():
-    file_size = message.file.size
+    file_size = os.path.getsize(file_path)
     range_header = request.headers.get("Range", None)
 
     start = 0
@@ -35,29 +35,14 @@ def stream():
     if range_header:
         start = int(range_header.split("=")[1].split("-")[0])
 
-    chunk_size = 1024 * 512  # smaller chunk = smoother
-
-    async def get_chunk(offset):
-        data = await client.download_file(
-            message.document,
-            offset=offset,
-            limit=chunk_size
-        )
-        return data
-
     def generate():
-        current = start
-        while current <= end:
-            future = asyncio.run_coroutine_threadsafe(
-                get_chunk(current), loop
-            )
-            chunk = future.result()
-
-            if not chunk:
-                break
-
-            yield chunk
-            current += len(chunk)
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            while True:
+                chunk = f.read(1024 * 512)
+                if not chunk:
+                    break
+                yield chunk
 
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -67,11 +52,22 @@ def stream():
 
     return Response(generate(), status=206, headers=headers)
 
+
+def download_file():
+    print("⬇️ Downloading file...")
+    client.loop.run_until_complete(
+        client.download_media(message.document, file_path)
+    )
+    print("✅ Download complete")
+
+
 def start_server(cli, msg):
-    global client, message, loop
+    global client, message
     client = cli
     message = msg
-    loop = asyncio.get_event_loop()
+
+    # Start downloading in background
+    threading.Thread(target=download_file).start()
 
     print("🚀 Server running at http://127.0.0.1:8000")
 
