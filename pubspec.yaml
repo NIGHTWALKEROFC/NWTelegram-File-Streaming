@@ -13,7 +13,7 @@ dependencies:
   # Telegram TDLib wrapper
   flutter_tdlib:
     git:
-      url: https://github.com/dreampowder/flutter_tdlib.git
+      url: https://github.com/ivk1800/flutter_tdlib.git
       ref: main
 
   # Video player
