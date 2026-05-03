@@ -1,13 +1,12 @@
 from flask import Flask, Response, request
-import threading
-import webbrowser
+import asyncio
 import os
-import time
 
 app = Flask(__name__)
 
+client = None
+message = None
 file_path = "temp_video.mp4"
-downloading = True
 
 
 @app.route("/")
@@ -28,58 +27,43 @@ def home():
 
 @app.route("/stream")
 def stream():
-    range_header = request.headers.get("Range", None)
-
-    def generate(start):
+    def generate():
         with open(file_path, "rb") as f:
-            f.seek(start)
-
             while True:
                 chunk = f.read(1024 * 512)
-
-                if chunk:
-                    yield chunk
-                else:
-                    if downloading:
-                        time.sleep(0.5)  # wait for more data
-                        continue
-                    else:
-                        break
-
-    start = 0
-    if range_header:
-        start = int(range_header.split("=")[1].split("-")[0])
+                if not chunk:
+                    break
+                yield chunk
 
     file_size = os.path.getsize(file_path)
 
     headers = {
-        "Content-Range": f"bytes {start}-{file_size-1}/*",
-        "Accept-Ranges": "bytes",
         "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes",
     }
 
-    return Response(generate(start), status=206, headers=headers)
+    return Response(generate(), headers=headers)
 
 
-def start_download(client, message):
-    global downloading
-
-    print("⬇️ Downloading in background...")
-
+async def download_progressively():
     with open(file_path, "wb") as f:
-        for chunk in client.iter_download(message.document):
+        async for chunk in client.iter_download(message.document):
             f.write(chunk)
 
-    downloading = False
-    print("✅ Download complete")
 
+async def start_server(cli, msg):
+    global client, message
+    client = cli
+    message = msg
 
-def start_server(client, message):
-    # Start download thread
-    threading.Thread(target=start_download, args=(client, message)).start()
+    print("⬇️ Starting progressive download...")
+
+    # Start download in same loop (safe)
+    asyncio.create_task(download_progressively())
 
     print("🚀 Server running at http://127.0.0.1:8000")
 
+    import webbrowser
     webbrowser.open("http://127.0.0.1:8000")
 
     app.run(host="127.0.0.1", port=8000)
