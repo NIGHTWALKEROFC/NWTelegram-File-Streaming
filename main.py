@@ -1,4 +1,3 @@
-import re
 import asyncio
 from telethon import TelegramClient
 from utils import extract_link
@@ -11,21 +10,26 @@ client = TelegramClient("session", api_id, api_hash)
 
 async def main():
     await client.start()
-    print("✅ Logged in successfully")
+    print("✅ Logged in")
 
     link = input("Paste Telegram link: ")
-
     chat, msg_id = extract_link(link)
 
     message = await client.get_messages(chat, ids=msg_id)
 
     if not message or not message.document:
-        print("❌ No file found in this message")
+        print("❌ No file found")
         return
 
     print(f"📁 File: {message.file.name}")
     print(f"📦 Size: {message.file.size / (1024*1024):.2f} MB")
 
-    start_server(client, message)
+    print("⬇️ Downloading file...")
+
+    await client.download_media(message.document, "temp_video.mp4")
+
+    print("✅ Download complete")
+
+    start_server()
 
 asyncio.run(main())
