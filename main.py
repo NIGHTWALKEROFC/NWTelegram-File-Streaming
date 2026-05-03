@@ -24,14 +24,6 @@ async def main():
     print(f"📁 File: {message.file.name}")
     print(f"📦 Size: {message.file.size / (1024*1024):.2f} MB")
 
-    # ❌ REMOVE full download
-    # await client.download_media(...)
+    await start_server(client, message)
 
-    print("🚀 Starting streaming...")
-
-    # ✅ Start streaming + background download
-    start_server(client, message)
-
-# IMPORTANT: keep single event loop
-with client:
-    client.loop.run_until_complete(main())
+asyncio.run(main())
