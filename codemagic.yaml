@@ -3,9 +3,9 @@ workflows:
     name: Android Release Build
     max_build_duration: 60
     environment:
-      flutter: stable
-      android_signing:
-        - android_keystore  # Configure in CodeMagic dashboard
+  flutter: stable
+  groups:
+    - telegram_keys
       vars:
         PACKAGE_NAME: "com.yourapp.telegram_streamer"
         # Add these in CodeMagic Environment Variables (encrypted):
