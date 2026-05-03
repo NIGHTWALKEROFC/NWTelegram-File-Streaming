@@ -10,8 +10,9 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Telegram TDLib wrapper (pub.dev — replaces broken ivk1800/tdlib git dep)
-  tdlib: ^1.8.0
+  # Telegram TDLib wrapper — latest stable on pub.dev (i-Naji/tdlib)
+  # wraps TDLib v1.8.15, bundles Android .so automatically
+  tdlib: ^1.6.0
 
   # Video player
   video_player: ^2.8.3
