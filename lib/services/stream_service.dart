@@ -12,10 +12,8 @@ class StreamService extends ChangeNotifier {
   int _activeFileId = 0;
 
   bool get isRunning => _isRunning;
-  // Restored: streamUrl getter
   String get streamUrl => 'http://127.0.0.1:8484/stream';
 
-  // Restored: setActiveFile method
   void setActiveFile(int fileId, int fileSize, String mimeType) {
     _activeFileId = fileId;
     notifyListeners();
@@ -24,13 +22,13 @@ class StreamService extends ChangeNotifier {
   Future<void> startServer(TelegramService telegram) async {
     if (_isRunning) return;
     final router = Router();
-    router.get('/stream', (Request req) => Response.ok('Streaming...'));
+    router.get('/stream', (Request req) => Response.ok('Stream Proxy Live'));
     try {
       _server = await shelf_io.serve(router, '127.0.0.1', 8484);
       _isRunning = true;
       notifyListeners();
     } catch (e) {
-      debugPrint("Server Error: $e");
+      debugPrint("Streaming Server Error: $e");
     }
   }
 
