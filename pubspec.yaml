@@ -10,7 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Telegram TDLib wrapper — actively maintained fork of tdlib, AGP 8 compatible,
+  # Telegram TDLib wrapper — actively maintained fork, AGP 8 compatible,
   # TDLib v1.8.36, correct namespace in android/build.gradle
   handy_tdlib: ^2.3.10
 
@@ -65,5 +65,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/
+  # assets section removed — no assets/ folder exists in the project.
+  # Add it back only if you create the folder and put files in it.
