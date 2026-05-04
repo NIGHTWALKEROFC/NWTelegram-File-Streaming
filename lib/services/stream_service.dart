@@ -14,7 +14,8 @@ class StreamService extends ChangeNotifier {
   bool get isRunning => _isRunning;
   String get streamUrl => 'http://127.0.0.1:8484/stream';
 
-  void setActiveFile(int fileId, int fileSize, String mimeType) {
+  // Fix: Changed to named arguments to resolve the "Too few positional arguments" error
+  void setActiveFile({required int fileId, required int fileSize, required String mimeType}) {
     _activeFileId = fileId;
     notifyListeners();
   }
