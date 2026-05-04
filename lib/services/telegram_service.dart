@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:io' as io; // ← prefixed: handy_tdlib exports its own 'File' class
+                        //   which would shadow dart:io.File without this prefix
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:handy_tdlib/handy_tdlib.dart'; // ← handy_tdlib: AGP-8-compatible fork
+import 'package:handy_tdlib/handy_tdlib.dart';
 
 import '../models/telegram_file.dart';
 
@@ -28,7 +29,6 @@ enum AuthState {
 }
 
 class TelegramService extends ChangeNotifier {
-  // handy_tdlib uses the same TdPlugin singleton + integer client ID as tdlib
   int? _clientId;
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -38,7 +38,6 @@ class TelegramService extends ChangeNotifier {
   bool _isInitialized = false;
   Timer? _receiveTimer;
 
-  // Stream controller for TDLib updates
   final StreamController<Map<String, dynamic>> _updateController =
       StreamController.broadcast();
 
@@ -57,9 +56,8 @@ class TelegramService extends ChangeNotifier {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final dbPath = '${dir.path}/tdlib';
-      await Directory(dbPath).create(recursive: true);
+      await io.Directory(dbPath).create(recursive: true); // ← io. prefix
 
-      // handy_tdlib: same API as tdlib — TdPlugin singleton + tdCreateClientId()
       await TdPlugin.initialize();
       _clientId = TdPlugin.instance.tdCreateClientId();
       _isInitialized = true;
@@ -75,12 +73,12 @@ class TelegramService extends ChangeNotifier {
   }
 
   void _startUpdateListener() {
-    _receiveTimer =
-        Timer.periodic(const Duration(milliseconds: 100), (_) {
+    _receiveTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (_clientId == null) return;
       try {
-        // handy_tdlib: tdReceive(clientId) — same as tdlib
-        final response = TdPlugin.instance.tdReceive(_clientId!);
+        // ← fixed: handy_tdlib's tdReceive takes a double timeout (seconds),
+        //   NOT a client int ID. The client ID is set internally via tdCreateClientId().
+        final response = TdPlugin.instance.tdReceive(0.1);
         if (response != null) {
           final Map<String, dynamic> update = json.decode(response);
           _updateController.add(update);
@@ -408,7 +406,8 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Download file part for streaming
-  // Uses RandomAccessFile — avoids loading the full file into RAM per chunk
+  // Uses io.RandomAccessFile for range reads — avoids loading
+  // the full file into RAM per chunk (critical for large videos)
   // ──────────────────────────────────────────
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -430,10 +429,11 @@ class TelegramService extends ChangeNotifier {
       final localPath = response['local']?['path'] as String?;
       if (localPath == null || localPath.isEmpty) return null;
 
-      final file = File(localPath);
-      if (!await file.exists()) return null;
+      // ← io. prefix used throughout to avoid conflict with handy_tdlib's File
+      final ioFile = io.File(localPath);
+      if (!await ioFile.exists()) return null;
 
-      final raf = await file.open();
+      final raf = await ioFile.open();
       try {
         final fileLength = await raf.length();
         if (offset >= fileLength) return Uint8List(0);
@@ -467,7 +467,7 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Low-level TDLib request
-  // handy_tdlib API: tdSend(clientId, jsonString) — same as tdlib
+  // handy_tdlib: tdSend(clientId, jsonString)
   // ──────────────────────────────────────────
   Future<Map<String, dynamic>?> _sendRequest(
     Map<String, dynamic> request,
@@ -487,7 +487,6 @@ class TelegramService extends ChangeNotifier {
       }
     });
 
-    // handy_tdlib: tdSend(clientId, jsonString)
     TdPlugin.instance.tdSend(_clientId!, json.encode(request));
 
     return completer.future.timeout(
