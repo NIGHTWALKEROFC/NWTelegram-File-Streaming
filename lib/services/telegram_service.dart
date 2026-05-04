@@ -14,7 +14,6 @@ enum AuthState { idle, waitingPhone, waitingCode, waitingPassword, authorized, e
 
 class TelegramService extends ChangeNotifier {
   int? _clientId;
-  final _storage = const FlutterSecureStorage();
   AuthState _authState = AuthState.idle;
   String _errorMessage = '';
   bool _isLoggedIn = false;
@@ -81,23 +80,25 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // Restored: resolveLink method
   Future<TelegramFile?> resolveLink(String link) async {
     _errorMessage = '';
+    notifyListeners();
     try {
-      final searchRes = await _sendRequest({
+      final res = await _sendRequest({
         '@type': 'getInternalLinkAttributes',
         'link': link,
       });
-      if (searchRes == null || searchRes['@type'] == 'error') {
-        _errorMessage = searchRes?['message'] ?? 'Invalid link';
+      if (res == null || res['@type'] == 'error') {
+        _errorMessage = res?['message'] ?? 'Link resolution failed';
+        notifyListeners();
         return null;
       }
-      // Logic for fetching message and converting to TelegramFile would go here
-      // For now, returning null to prevent crash until logic is fully mapped
+      // Note: Full mapping logic for TelegramFile from message goes here.
+      // Returning null for now to ensure compilation passes.
       return null; 
     } catch (e) {
       _errorMessage = e.toString();
+      notifyListeners();
       return null;
     }
   }
@@ -115,7 +116,7 @@ class TelegramService extends ChangeNotifier {
       }
     });
     TdPlugin.instance.tdSend(_clientId!, json.encode(request));
-    return completer.future.timeout(const Duration(seconds: 15), onTimeout: () {
+    return completer.future.timeout(const Duration(seconds: 20), onTimeout: () {
       sub.cancel();
       return null;
     });
