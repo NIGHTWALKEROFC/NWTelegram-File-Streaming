@@ -7,7 +7,7 @@ plugins {
 android {
     namespace "com.yourapp.telegram_streamer"
     compileSdk flutter.compileSdkVersion
-    ndkVersion "28.2.13676358"  // ← required by build log
+    ndkVersion "28.2.13676358" 
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
