@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LaunchTheme: shown while Flutter engine loads -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">@color/launch_background</item>
+        <item name="android:windowFullscreen">false</item>
+    </style>
+
+    <!-- NormalTheme: applied after Flutter renders its first frame -->
+    <style name="NormalTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowFullscreen">false</item>
+    </style>
+</resources>
