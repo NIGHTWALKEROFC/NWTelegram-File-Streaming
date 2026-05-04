@@ -5,7 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:tdlib/tdlib.dart'; // tdlib: ^1.6.0  (i-Naji/tdlib on pub.dev)
+import 'package:handy_tdlib/handy_tdlib.dart'; // ← handy_tdlib: AGP-8-compatible fork
 
 import '../models/telegram_file.dart';
 
@@ -28,7 +28,7 @@ enum AuthState {
 }
 
 class TelegramService extends ChangeNotifier {
-  // tdlib 1.6.0: TdPlugin singleton + integer client ID
+  // handy_tdlib uses the same TdPlugin singleton + integer client ID as tdlib
   int? _clientId;
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -59,18 +59,13 @@ class TelegramService extends ChangeNotifier {
       final dbPath = '${dir.path}/tdlib';
       await Directory(dbPath).create(recursive: true);
 
-      // tdlib 1.6.0: initialize the native plugin once, then allocate a client
+      // handy_tdlib: same API as tdlib — TdPlugin singleton + tdCreateClientId()
       await TdPlugin.initialize();
       _clientId = TdPlugin.instance.tdCreateClientId();
       _isInitialized = true;
 
-      // Start polling for updates
       _startUpdateListener();
-
-      // Send TDLib parameters
       await _sendTdLibParams(dbPath);
-
-      // Wait for first auth state update
       await _waitForInitialAuthState();
     } catch (e) {
       _errorMessage = 'Failed to initialize: $e';
@@ -80,13 +75,12 @@ class TelegramService extends ChangeNotifier {
   }
 
   void _startUpdateListener() {
-    // Poll TDLib every 100 ms on a timer.
-    // tdlib 1.6.0: tdReceive() is synchronous on TdPlugin.instance
     _receiveTimer =
         Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (_clientId == null) return;
       try {
-        final response = TdPlugin.instance.tdReceive(0.1);
+        // handy_tdlib: tdReceive(clientId) — same as tdlib
+        final response = TdPlugin.instance.tdReceive(_clientId!);
         if (response != null) {
           final Map<String, dynamic> update = json.decode(response);
           _updateController.add(update);
@@ -414,8 +408,7 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Download file part for streaming
-  // Uses RandomAccessFile for true range reads — avoids loading
-  // the entire file into RAM per chunk (critical for large videos)
+  // Uses RandomAccessFile — avoids loading the full file into RAM per chunk
   // ──────────────────────────────────────────
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -440,7 +433,6 @@ class TelegramService extends ChangeNotifier {
       final file = File(localPath);
       if (!await file.exists()) return null;
 
-      // RandomAccessFile for O(chunk) memory — not O(fileSize)
       final raf = await file.open();
       try {
         final fileLength = await raf.length();
@@ -475,7 +467,7 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Low-level TDLib request
-  // tdlib 1.6.0 API: tdSend(clientId, jsonString)
+  // handy_tdlib API: tdSend(clientId, jsonString) — same as tdlib
   // ──────────────────────────────────────────
   Future<Map<String, dynamic>?> _sendRequest(
     Map<String, dynamic> request,
@@ -495,7 +487,7 @@ class TelegramService extends ChangeNotifier {
       }
     });
 
-    // tdlib 1.6.0: tdSend takes (clientId, jsonString)
+    // handy_tdlib: tdSend(clientId, jsonString)
     TdPlugin.instance.tdSend(_clientId!, json.encode(request));
 
     return completer.future.timeout(
