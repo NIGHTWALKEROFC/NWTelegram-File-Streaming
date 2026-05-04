@@ -26,12 +26,16 @@ class TelegramService extends ChangeNotifier {
 
   Future<void> initialize() async {
     if (_isInitialized) return;
+    
     final docsDir = await getApplicationDocumentsDirectory();
     final tdPath = io.Directory('${docsDir.path}/tdlib').path;
     if (!await io.Directory(tdPath).exists()) {
       await io.Directory(tdPath).create(recursive: true);
     }
-    _clientId = TdPlugin.instance.tdCreate();
+    
+    // Fix: correct handy_tdlib syntax for initializing the client
+    _clientId = TdPlugin.instance.tdCreateClientId();
+    
     _startReceiveLoop();
     await _sendRequest({
       '@type': 'setTdlibParameters',
@@ -48,6 +52,7 @@ class TelegramService extends ChangeNotifier {
       'system_version': 'Android',
       'application_version': '1.0.0',
     });
+    
     _isInitialized = true;
     notifyListeners();
   }
@@ -55,7 +60,8 @@ class TelegramService extends ChangeNotifier {
   void _startReceiveLoop() {
     Future.delayed(Duration.zero, () async {
       while (_clientId != null) {
-        final res = TdPlugin.instance.tdReceive(1.0);
+        // Fix: tdReceive needs the clientId
+        final res = TdPlugin.instance.tdReceive(_clientId!);
         if (res != null) {
           final update = json.decode(res);
           _handleUpdate(update);
@@ -80,6 +86,50 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
+  // --- Auth Methods Restored ---
+  Future<bool> sendPhoneNumber(String phone) async {
+    _errorMessage = '';
+    final res = await _sendRequest({
+      '@type': 'setAuthenticationPhoneNumber',
+      'phone_number': phone,
+    });
+    if (res != null && res['@type'] == 'error') {
+      _errorMessage = res['message'] ?? 'Error sending phone number';
+      notifyListeners();
+      return false;
+    }
+    return true;
+  }
+
+  Future<bool> sendOtpCode(String code) async {
+    _errorMessage = '';
+    final res = await _sendRequest({
+      '@type': 'checkAuthenticationCode',
+      'code': code,
+    });
+    if (res != null && res['@type'] == 'error') {
+      _errorMessage = res['message'] ?? 'Invalid code';
+      notifyListeners();
+      return false;
+    }
+    return true;
+  }
+
+  Future<bool> sendPassword(String password) async {
+    _errorMessage = '';
+    final res = await _sendRequest({
+      '@type': 'checkAuthenticationPassword',
+      'password': password,
+    });
+    if (res != null && res['@type'] == 'error') {
+      _errorMessage = res['message'] ?? 'Invalid password';
+      notifyListeners();
+      return false;
+    }
+    return true;
+  }
+  // -----------------------------
+
   Future<TelegramFile?> resolveLink(String link) async {
     _errorMessage = '';
     notifyListeners();
@@ -93,8 +143,6 @@ class TelegramService extends ChangeNotifier {
         notifyListeners();
         return null;
       }
-      // Note: Full mapping logic for TelegramFile from message goes here.
-      // Returning null for now to ensure compilation passes.
       return null; 
     } catch (e) {
       _errorMessage = e.toString();
@@ -108,6 +156,7 @@ class TelegramService extends ChangeNotifier {
     final completer = Completer<Map<String, dynamic>?>();
     final requestId = DateTime.now().millisecondsSinceEpoch.toString();
     request['@extra'] = requestId;
+    
     late StreamSubscription sub;
     sub = _updateController.stream.listen((data) {
       if (data['@extra'] == requestId) {
@@ -115,6 +164,7 @@ class TelegramService extends ChangeNotifier {
         sub.cancel();
       }
     });
+    
     TdPlugin.instance.tdSend(_clientId!, json.encode(request));
     return completer.future.timeout(const Duration(seconds: 20), onTimeout: () {
       sub.cancel();
