@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io'; // ← added: HttpServer lives here
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:shelf/shelf.dart';
@@ -115,17 +116,16 @@ class StreamService extends ChangeNotifier {
         : await _telegramService!.getFileSize(_activeFileId);
 
     if (fileSize <= 0) {
-      return Response.internalServerError(body: 'Could not determine file size');
+      return Response.internalServerError(
+          body: 'Could not determine file size');
     }
 
     final rangeHeader = request.headers['range'];
 
     if (rangeHeader == null) {
-      // Full file stream (chunked)
       return _streamFullFile(fileSize);
     }
 
-    // Parse Range: bytes=start-end
     final range = _parseRange(rangeHeader, fileSize);
     if (range == null) {
       return Response(416, headers: {
@@ -142,9 +142,7 @@ class StreamService extends ChangeNotifier {
 
   Response _streamFullFile(int fileSize) {
     final controller = StreamController<List<int>>();
-
     _fetchChunksAsync(0, fileSize - 1, controller);
-
     return Response.ok(
       controller.stream,
       headers: {
@@ -158,9 +156,7 @@ class StreamService extends ChangeNotifier {
 
   Response _streamRange(int start, int end, int length, int fileSize) {
     final controller = StreamController<List<int>>();
-
     _fetchChunksAsync(start, end, controller);
-
     return Response(
       206,
       body: controller.stream,
@@ -212,7 +208,6 @@ class StreamService extends ChangeNotifier {
   // Helpers
   // ──────────────────────────────────────────
   (int, int)? _parseRange(String header, int fileSize) {
-    // Format: "bytes=start-end" or "bytes=start-"
     final match = RegExp(r'bytes=(\d*)-(\d*)').firstMatch(header);
     if (match == null) return null;
 
@@ -220,7 +215,8 @@ class StreamService extends ChangeNotifier {
     final endStr = match.group(2) ?? '';
 
     int start = startStr.isEmpty ? 0 : int.tryParse(startStr) ?? 0;
-    int end = endStr.isEmpty ? fileSize - 1 : int.tryParse(endStr) ?? fileSize - 1;
+    int end =
+        endStr.isEmpty ? fileSize - 1 : int.tryParse(endStr) ?? fileSize - 1;
 
     end = end.clamp(0, fileSize - 1);
     start = start.clamp(0, end);
