@@ -1,13 +1,18 @@
+// android/app/build.gradle
+// THIS FILE WAS MISSING FROM YOUR REPO — primary crash cause
+
 plugins {
     id "com.android.application"
-    id "org.jetbrains.kotlin.android"
+    id "kotlin-android"
     id "dev.flutter.flutter-gradle-plugin"
 }
 
 android {
-    namespace "com.yourapp.telegram_streamer"
+    namespace "com.nightwalker.telegram_streamer"
     compileSdk flutter.compileSdkVersion
-    ndkVersion "28.2.13676358"  // ← required by build log
+
+    // handy_tdlib requires NDK 27
+    ndkVersion "27.0.12077973"
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -19,16 +24,16 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.yourapp.telegram_streamer"
-        minSdk 21
-        targetSdk flutter.targetSdkVersion
+        applicationId "com.nightwalker.telegram_streamer"
+        minSdkVersion 21
+        targetSdkVersion flutter.targetSdkVersion
         versionCode flutter.versionCode
         versionName flutter.versionName
-        multiDexEnabled true
     }
 
     buildTypes {
         release {
+            // Use debug signing for now — replace with your keystore when publishing
             signingConfig signingConfigs.debug
             minifyEnabled false
             shrinkResources false
@@ -38,9 +43,4 @@ android {
 
 flutter {
     source "../.."
-}
-
-dependencies {
-    implementation "org.jetbrains.kotlin:kotlin-stdlib:2.1.0"
-    implementation "androidx.multidex:multidex:2.0.1"
 }
