@@ -1,3 +1,5 @@
+// lib/services/telegram_service.dart
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
@@ -10,10 +12,9 @@ import 'package:handy_tdlib/handy_tdlib.dart';
 import '../models/telegram_file.dart';
 
 // ─────────────────────────────────────────────────────
-//  API credentials are injected at build time via
+//  API credentials injected at build time via
 //  --dart-define=TG_API_ID=... --dart-define=TG_API_HASH=...
-//  set inside codemagic.yaml  (no sed needed).
-//  Get your real values from https://my.telegram.org
+//  Set inside codemagic.yaml. Get values from https://my.telegram.org
 // ─────────────────────────────────────────────────────
 const int kApiId = int.fromEnvironment('TG_API_ID', defaultValue: 0);
 const String kApiHash = String.fromEnvironment('TG_API_HASH', defaultValue: '');
@@ -46,48 +47,35 @@ class TelegramService extends ChangeNotifier {
 
   // ──────────────────────────────────────────
   // Initialize
-  // MUST be called after WidgetsFlutterBinding.ensureInitialized()
-  // and after the first frame (addPostFrameCallback).
   // ──────────────────────────────────────────
   Future<void> initialize() async {
     if (_isInitialized) return;
 
-    // Guard: catch missing credentials early so the app shows
-    // a readable error instead of crashing inside TDLib.
     if (kApiId == 0 || kApiHash.isEmpty) {
       _errorMessage =
           'Telegram API credentials are missing.\n'
           'Make sure TG_API_ID and TG_API_HASH are set in Codemagic '
-          'environment variables and the codemagic.yaml passes them via '
-          '--dart-define.';
+          'environment variables and passed via --dart-define.';
       _authState = AuthState.error;
       notifyListeners();
       return;
     }
 
     try {
-      // 1. Get a writable directory for TDLib's database
       final appDir = await getApplicationDocumentsDirectory();
       final dbPath = '${appDir.path}/tdlib_db';
       final filesPath = '${appDir.path}/tdlib_files';
       await io.Directory(dbPath).create(recursive: true);
       await io.Directory(filesPath).create(recursive: true);
 
-      // 2. Load the native libtdjni.so — this is what crashes if called
-      //    before WidgetsBinding is initialized or off the main isolate.
       await TdPlugin.initialize();
 
-      // 3. Create a TDLib client. Returns an opaque int client ID.
       _clientId = TdPlugin.instance.tdCreateClientId();
       debugPrint('TelegramService: client created, id=$_clientId');
 
       _isInitialized = true;
-
-      // 4. Start the receive loop BEFORE sending params so we
-      //    catch the first authorizationStateWaitTdlibParameters event.
       _startReceiveLoop();
 
-      // 5. Send TDLib parameters — triggers the auth state machine.
       _sendRaw({
         '@type': 'setTdlibParameters',
         'use_test_dc': false,
@@ -106,7 +94,6 @@ class TelegramService extends ChangeNotifier {
         'enable_storage_optimizer': true,
       });
 
-      // 6. Wait up to 10 seconds for TDLib to emit first auth state update
       await _waitForFirstAuthState();
     } catch (e, stack) {
       debugPrint('TelegramService.initialize FAILED: $e\n$stack');
@@ -124,7 +111,6 @@ class TelegramService extends ChangeNotifier {
     _receiveTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (!_isInitialized) return;
       try {
-        // tdReceive(double timeout) returns JSON string or null
         final raw = TdPlugin.instance.tdReceive(0.1);
         if (raw == null || raw.isEmpty) return;
 
@@ -175,6 +161,14 @@ class TelegramService extends ChangeNotifier {
       case 'authorizationStateWaitTdlibParameters':
         _authState = AuthState.idle;
         break;
+
+      // FIX: TDLib 1.8+ emits this on first run or after DB upgrades.
+      // Must respond with checkDatabaseEncryptionKey or TDLib hangs forever,
+      // causing the app to freeze on splash and never reach login.
+      case 'authorizationStateWaitEncryptionKey':
+        _sendRaw({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''});
+        break;
+
       case 'authorizationStateWaitPhoneNumber':
         _authState = AuthState.waitingPhone;
         _isLoggedIn = false;
@@ -325,13 +319,20 @@ class TelegramService extends ChangeNotifier {
 
     final w = video['width'] as int? ?? 0;
     final h = video['height'] as int? ?? 0;
+
+    // FIX: Fall back to expected_size when size is 0 (file not yet downloaded)
+    int _fileSize(Map<String, dynamic> f) =>
+        (f['size'] as int? ?? 0) > 0
+            ? f['size'] as int
+            : (f['expected_size'] as int? ?? 0);
+
     final qualities = <VideoQuality>[
       VideoQuality(
         label: _label(h),
         width: w,
         height: h,
         fileId: file['id'] as int? ?? 0,
-        fileSize: file['size'] as int? ?? 0,
+        fileSize: _fileSize(file),
         remoteId: (file['remote'] as Map?)?['id'] as String? ?? '',
       ),
     ];
@@ -345,7 +346,7 @@ class TelegramService extends ChangeNotifier {
         width: a['width'] as int? ?? 0,
         height: ah,
         fileId: af['id'] as int? ?? 0,
-        fileSize: af['size'] as int? ?? 0,
+        fileSize: _fileSize(af),
         remoteId: (af['remote'] as Map?)?['id'] as String? ?? '',
       ));
     }
@@ -359,7 +360,7 @@ class TelegramService extends ChangeNotifier {
       width: w,
       height: h,
       fileId: file['id'] as int? ?? 0,
-      fileSize: file['size'] as int? ?? 0,
+      fileSize: _fileSize(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       thumbnail: _thumbPath(video['thumbnail']),
       qualities: qualities,
@@ -376,7 +377,9 @@ class TelegramService extends ChangeNotifier {
       mimeType: audio['mime_type'] as String? ?? 'audio/mpeg',
       duration: audio['duration'] as int? ?? 0,
       fileId: file['id'] as int? ?? 0,
-      fileSize: file['size'] as int? ?? 0,
+      fileSize: (file['size'] as int? ?? 0) > 0
+          ? file['size'] as int
+          : (file['expected_size'] as int? ?? 0),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -391,7 +394,9 @@ class TelegramService extends ChangeNotifier {
       name: doc['file_name'] as String? ?? 'file',
       mimeType: doc['mime_type'] as String? ?? 'application/octet-stream',
       fileId: file['id'] as int? ?? 0,
-      fileSize: file['size'] as int? ?? 0,
+      fileSize: (file['size'] as int? ?? 0) > 0
+          ? file['size'] as int
+          : (file['expected_size'] as int? ?? 0),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -407,7 +412,9 @@ class TelegramService extends ChangeNotifier {
       mimeType: voice['mime_type'] as String? ?? 'audio/ogg',
       duration: voice['duration'] as int? ?? 0,
       fileId: file['id'] as int? ?? 0,
-      fileSize: file['size'] as int? ?? 0,
+      fileSize: (file['size'] as int? ?? 0) > 0
+          ? file['size'] as int
+          : (file['expected_size'] as int? ?? 0),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -423,7 +430,9 @@ class TelegramService extends ChangeNotifier {
       mimeType: 'video/mp4',
       duration: vn['duration'] as int? ?? 0,
       fileId: file['id'] as int? ?? 0,
-      fileSize: file['size'] as int? ?? 0,
+      fileSize: (file['size'] as int? ?? 0) > 0
+          ? file['size'] as int
+          : (file['expected_size'] as int? ?? 0),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -447,8 +456,11 @@ class TelegramService extends ChangeNotifier {
   }
 
   // ──────────────────────────────────────────
-  // Stream a byte range of a file
-  // Uses RandomAccessFile — only 'count' bytes in RAM at once
+  // Download a byte range of a file for streaming
+  // FIX: Original code read raf.length() (total disk size) to decide
+  // how many bytes to read. For streaming, only a PREFIX of the file
+  // is downloaded at any time. The correct field is
+  // local.downloaded_prefix_size from TDLib's response.
   // ──────────────────────────────────────────
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -464,21 +476,30 @@ class TelegramService extends ChangeNotifier {
         'limit': count,
         'synchronous': true,
       });
-      if (res == null || res['@type'] == 'error') return null;
 
-      final path =
-          (res['local'] as Map<String, dynamic>?)?['path'] as String?;
+      if (res == null || res['@type'] == 'error') {
+        debugPrint('downloadFilePart TDLib error: ${res?['message']}');
+        return null;
+      }
+
+      final local = res['local'] as Map<String, dynamic>?;
+      final path = local?['path'] as String?;
       if (path == null || path.isEmpty) return null;
 
       final f = io.File(path);
       if (!await f.exists()) return null;
 
+      // How many bytes from the start of the file are actually on disk
+      final downloadedPrefix = (local?['downloaded_prefix_size'] as int?) ?? 0;
+
+      // Bytes available starting at our requested offset
+      final available = (downloadedPrefix - offset).clamp(0, count);
+      if (available <= 0) return Uint8List(0);
+
       final raf = await f.open();
       try {
-        final len = await raf.length();
-        if (offset >= len) return Uint8List(0);
         await raf.setPosition(offset);
-        return await raf.read(count.clamp(0, len - offset));
+        return await raf.read(available);
       } finally {
         await raf.close();
       }
@@ -492,7 +513,9 @@ class TelegramService extends ChangeNotifier {
     try {
       final res = await _sendRequest({'@type': 'getFile', 'file_id': fileId});
       if (res == null || res['@type'] == 'error') return 0;
-      return (res['size'] as int?) ?? (res['expected_size'] as int?) ?? 0;
+      // FIX: also check expected_size when size is 0
+      final size = res['size'] as int? ?? 0;
+      return size > 0 ? size : (res['expected_size'] as int? ?? 0);
     } catch (_) {
       return 0;
     }
@@ -501,9 +524,6 @@ class TelegramService extends ChangeNotifier {
   // ──────────────────────────────────────────
   // Low-level send/receive
   // ──────────────────────────────────────────
-
-  /// Fire-and-forget send — used for setTdlibParameters before
-  /// the receive loop is ready to match @extra fields.
   void _sendRaw(Map<String, dynamic> req) {
     if (_clientId == null) return;
     try {
@@ -513,7 +533,6 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  /// Send a request and await the matching response via @extra.
   Future<Map<String, dynamic>?> _sendRequest(
       Map<String, dynamic> req) async {
     if (_clientId == null) return null;
