@@ -4,18 +4,19 @@ import 'dart:io' as io;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:handy_tdlib/handy_tdlib.dart';
 
 import '../models/telegram_file.dart';
 
 // ─────────────────────────────────────────────────────
-//  Injected at build time by codemagic.yaml sed steps.
+//  API credentials are injected at build time via
+//  --dart-define=TG_API_ID=... --dart-define=TG_API_HASH=...
+//  set inside codemagic.yaml  (no sed needed).
 //  Get your real values from https://my.telegram.org
 // ─────────────────────────────────────────────────────
-const int kApiId = 12345678;
-const String kApiHash = 'your_api_hash_here';
+const int kApiId = int.fromEnvironment('TG_API_ID', defaultValue: 0);
+const String kApiHash = String.fromEnvironment('TG_API_HASH', defaultValue: '');
 // ─────────────────────────────────────────────────────
 
 enum AuthState {
@@ -29,7 +30,6 @@ enum AuthState {
 
 class TelegramService extends ChangeNotifier {
   int? _clientId;
-  final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
   AuthState _authState = AuthState.idle;
   String _errorMessage = '';
@@ -51,6 +51,19 @@ class TelegramService extends ChangeNotifier {
   // ──────────────────────────────────────────
   Future<void> initialize() async {
     if (_isInitialized) return;
+
+    // Guard: catch missing credentials early so the app shows
+    // a readable error instead of crashing inside TDLib.
+    if (kApiId == 0 || kApiHash.isEmpty) {
+      _errorMessage =
+          'Telegram API credentials are missing.\n'
+          'Make sure TG_API_ID and TG_API_HASH are set in Codemagic '
+          'environment variables and the codemagic.yaml passes them via '
+          '--dart-define.';
+      _authState = AuthState.error;
+      notifyListeners();
+      return;
+    }
 
     try {
       // 1. Get a writable directory for TDLib's database
@@ -141,7 +154,9 @@ class TelegramService extends ChangeNotifier {
       completer.future,
       Future.delayed(const Duration(seconds: 10)),
     ]);
-    try { sub.cancel(); } catch (_) {}
+    try {
+      sub.cancel();
+    } catch (_) {}
   }
 
   void _handleUpdate(Map<String, dynamic> update) {
