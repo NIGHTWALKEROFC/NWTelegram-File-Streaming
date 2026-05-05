@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
@@ -9,13 +10,13 @@ import 'package:handy_tdlib/handy_tdlib.dart';
 
 import '../models/telegram_file.dart';
 
-// ─────────────────────────────────────────────
-//  YOUR REAL VALUES FROM https://my.telegram.org
-//  codemagic.yaml injects these at build time.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+//  Injected at build time by codemagic.yaml sed steps.
+//  Get your real values from https://my.telegram.org
+// ─────────────────────────────────────────────────────
 const int kApiId = 12345678;
 const String kApiHash = 'your_api_hash_here';
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
 
 enum AuthState {
   idle,
@@ -36,43 +37,66 @@ class TelegramService extends ChangeNotifier {
   bool _isInitialized = false;
   Timer? _receiveTimer;
 
-  final StreamController<Map<String, dynamic>> _updateController =
-      StreamController.broadcast();
+  final _updateController = StreamController<Map<String, dynamic>>.broadcast();
 
   AuthState get authState => _authState;
   String get errorMessage => _errorMessage;
   bool get isLoggedIn => _isLoggedIn;
   bool get isInitialized => _isInitialized;
-  Stream<Map<String, dynamic>> get updates => _updateController.stream;
 
   // ──────────────────────────────────────────
-  // Initialize TDLib
+  // Initialize
+  // MUST be called after WidgetsFlutterBinding.ensureInitialized()
+  // and after the first frame (addPostFrameCallback).
   // ──────────────────────────────────────────
   Future<void> initialize() async {
     if (_isInitialized) return;
 
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      final dbPath = '${dir.path}/tdlib';
+      // 1. Get a writable directory for TDLib's database
+      final appDir = await getApplicationDocumentsDirectory();
+      final dbPath = '${appDir.path}/tdlib_db';
+      final filesPath = '${appDir.path}/tdlib_files';
       await io.Directory(dbPath).create(recursive: true);
+      await io.Directory(filesPath).create(recursive: true);
 
-      // TdPlugin.initialize() loads the native .so library.
-      // Must be called before any other TDLib call.
+      // 2. Load the native libtdjni.so — this is what crashes if called
+      //    before WidgetsBinding is initialized or off the main isolate.
       await TdPlugin.initialize();
 
-      // Create a TDLib client — returns an integer client ID.
+      // 3. Create a TDLib client. Returns an opaque int client ID.
       _clientId = TdPlugin.instance.tdCreateClientId();
+      debugPrint('TelegramService: client created, id=$_clientId');
 
       _isInitialized = true;
 
-      // Start the 100ms polling timer BEFORE sending params,
-      // so we can receive the authorizationStateWaitTdlibParameters update.
-      _startUpdateListener();
+      // 4. Start the receive loop BEFORE sending params so we
+      //    catch the first authorizationStateWaitTdlibParameters event.
+      _startReceiveLoop();
 
-      await _sendTdLibParams(dbPath);
-      await _waitForInitialAuthState();
+      // 5. Send TDLib parameters — triggers the auth state machine.
+      _sendRaw({
+        '@type': 'setTdlibParameters',
+        'use_test_dc': false,
+        'database_directory': dbPath,
+        'files_directory': filesPath,
+        'use_file_database': true,
+        'use_chat_info_database': true,
+        'use_message_database': true,
+        'use_secret_chats': false,
+        'api_id': kApiId,
+        'api_hash': kApiHash,
+        'system_language_code': 'en',
+        'device_model': io.Platform.isAndroid ? 'Android' : 'iOS',
+        'system_version': 'Unknown',
+        'application_version': '1.0.0',
+        'enable_storage_optimizer': true,
+      });
+
+      // 6. Wait up to 10 seconds for TDLib to emit first auth state update
+      await _waitForFirstAuthState();
     } catch (e, stack) {
-      debugPrint('TelegramService.initialize error: $e\n$stack');
+      debugPrint('TelegramService.initialize FAILED: $e\n$stack');
       _errorMessage = e.toString();
       _authState = AuthState.error;
       notifyListeners();
@@ -80,54 +104,36 @@ class TelegramService extends ChangeNotifier {
   }
 
   // ──────────────────────────────────────────
-  // Poll TDLib every 100ms for updates
+  // Receive loop — polls TDLib every 100ms
   // ──────────────────────────────────────────
-  void _startUpdateListener() {
+  void _startReceiveLoop() {
+    _receiveTimer?.cancel();
     _receiveTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      if (_clientId == null) return;
+      if (!_isInitialized) return;
       try {
-        // tdReceive(double timeout) — returns a JSON string or null
-        final response = TdPlugin.instance.tdReceive(0.1);
-        if (response != null && response.isNotEmpty) {
-          final Map<String, dynamic> update = json.decode(response);
-          if (!_updateController.isClosed) {
-            _updateController.add(update);
-          }
-          _handleUpdate(update);
+        // tdReceive(double timeout) returns JSON string or null
+        final raw = TdPlugin.instance.tdReceive(0.1);
+        if (raw == null || raw.isEmpty) return;
+
+        final update = json.decode(raw) as Map<String, dynamic>;
+        debugPrint('TDLib update: ${update['@type']}');
+
+        if (!_updateController.isClosed) {
+          _updateController.add(update);
         }
+        _handleUpdate(update);
       } catch (e) {
         debugPrint('tdReceive error: $e');
       }
     });
   }
 
-  Future<void> _sendTdLibParams(String dbPath) async {
-    await _sendRequest({
-      '@type': 'setTdlibParameters',
-      'use_test_dc': false,
-      'database_directory': dbPath,
-      'files_directory': '$dbPath/files',
-      'use_file_database': true,
-      'use_chat_info_database': true,
-      'use_message_database': true,
-      'use_secret_chats': false,
-      'api_id': kApiId,
-      'api_hash': kApiHash,
-      'system_language_code': 'en',
-      'device_model': 'Android',
-      'system_version': 'Unknown',
-      'application_version': '1.0.0',
-      'enable_storage_optimizer': true,
-    });
-  }
-
-  // Wait up to 10s for the first auth state update from TDLib
-  Future<void> _waitForInitialAuthState() async {
+  Future<void> _waitForFirstAuthState() async {
     final completer = Completer<void>();
     late StreamSubscription sub;
-    sub = _updateController.stream.listen((update) {
-      if (update['@type'] == 'updateAuthorizationState') {
-        if (!completer.isCompleted) completer.complete();
+    sub = _updateController.stream.listen((u) {
+      if (u['@type'] == 'updateAuthorizationState' && !completer.isCompleted) {
+        completer.complete();
         sub.cancel();
       }
     });
@@ -135,33 +141,22 @@ class TelegramService extends ChangeNotifier {
       completer.future,
       Future.delayed(const Duration(seconds: 10)),
     ]);
-    // Cancel subscription if we hit the timeout
     try { sub.cancel(); } catch (_) {}
   }
 
-  // ──────────────────────────────────────────
-  // Handle incoming TDLib updates
-  // ──────────────────────────────────────────
   void _handleUpdate(Map<String, dynamic> update) {
     final type = update['@type'] as String?;
-    if (type == null) return;
-
-    switch (type) {
-      case 'updateAuthorizationState':
-        final state = update['authorization_state'] as Map<String, dynamic>?;
-        if (state != null) _handleAuthState(state);
-        break;
-      case 'error':
-        debugPrint('TDLib error: ${update['message']}');
-        break;
+    if (type == 'updateAuthorizationState') {
+      final state = update['authorization_state'] as Map<String, dynamic>?;
+      if (state != null) _handleAuthState(state);
     }
   }
 
-  void _handleAuthState(Map<String, dynamic> authStateMap) {
-    final stateType = authStateMap['@type'] as String?;
-    debugPrint('TDLib auth state: $stateType');
+  void _handleAuthState(Map<String, dynamic> state) {
+    final type = state['@type'] as String?;
+    debugPrint('TDLib auth state → $type');
 
-    switch (stateType) {
+    switch (type) {
       case 'authorizationStateWaitTdlibParameters':
         _authState = AuthState.idle;
         break;
@@ -180,8 +175,8 @@ class TelegramService extends ChangeNotifier {
         _isLoggedIn = true;
         break;
       case 'authorizationStateLoggingOut':
-      case 'authorizationStateClosed':
       case 'authorizationStateClosing':
+      case 'authorizationStateClosed':
         _authState = AuthState.waitingPhone;
         _isLoggedIn = false;
         break;
@@ -190,73 +185,55 @@ class TelegramService extends ChangeNotifier {
   }
 
   // ──────────────────────────────────────────
-  // Auth Methods
+  // Auth actions
   // ──────────────────────────────────────────
   Future<bool> sendPhoneNumber(String phoneNumber) async {
-    try {
-      _errorMessage = '';
-      final response = await _sendRequest({
-        '@type': 'setAuthenticationPhoneNumber',
-        'phone_number': phoneNumber,
-        'settings': {
-          '@type': 'phoneNumberAuthenticationSettings',
-          'allow_flash_call': false,
-          'allow_missed_call': false,
-          'is_current_phone_number': true,
-          'allow_sms_retriever_api': false,
-        },
-      });
-      if (response != null && response['@type'] == 'error') {
-        _errorMessage = response['message'] as String? ?? 'Unknown error';
-        notifyListeners();
-        return false;
-      }
-      return true;
-    } catch (e) {
-      _errorMessage = 'Failed to send phone number: $e';
+    _errorMessage = '';
+    final res = await _sendRequest({
+      '@type': 'setAuthenticationPhoneNumber',
+      'phone_number': phoneNumber,
+      'settings': {
+        '@type': 'phoneNumberAuthenticationSettings',
+        'allow_flash_call': false,
+        'allow_missed_call': false,
+        'is_current_phone_number': true,
+        'allow_sms_retriever_api': false,
+      },
+    });
+    if (res != null && res['@type'] == 'error') {
+      _errorMessage = res['message'] as String? ?? 'Error';
       notifyListeners();
       return false;
     }
+    return true;
   }
 
   Future<bool> sendOtpCode(String code) async {
-    try {
-      _errorMessage = '';
-      final response = await _sendRequest({
-        '@type': 'checkAuthenticationCode',
-        'code': code,
-      });
-      if (response != null && response['@type'] == 'error') {
-        _errorMessage = response['message'] as String? ?? 'Invalid code';
-        notifyListeners();
-        return false;
-      }
-      return true;
-    } catch (e) {
-      _errorMessage = 'Failed to verify code: $e';
+    _errorMessage = '';
+    final res = await _sendRequest({
+      '@type': 'checkAuthenticationCode',
+      'code': code,
+    });
+    if (res != null && res['@type'] == 'error') {
+      _errorMessage = res['message'] as String? ?? 'Invalid code';
       notifyListeners();
       return false;
     }
+    return true;
   }
 
   Future<bool> sendPassword(String password) async {
-    try {
-      _errorMessage = '';
-      final response = await _sendRequest({
-        '@type': 'checkAuthenticationPassword',
-        'password': password,
-      });
-      if (response != null && response['@type'] == 'error') {
-        _errorMessage = response['message'] as String? ?? 'Wrong password';
-        notifyListeners();
-        return false;
-      }
-      return true;
-    } catch (e) {
-      _errorMessage = 'Failed to verify password: $e';
+    _errorMessage = '';
+    final res = await _sendRequest({
+      '@type': 'checkAuthenticationPassword',
+      'password': password,
+    });
+    if (res != null && res['@type'] == 'error') {
+      _errorMessage = res['message'] as String? ?? 'Wrong password';
       notifyListeners();
       return false;
     }
+    return true;
   }
 
   Future<void> logout() async {
@@ -269,41 +246,32 @@ class TelegramService extends ChangeNotifier {
   }
 
   // ──────────────────────────────────────────
-  // Resolve Telegram link → TelegramFile
+  // Resolve a t.me link to a TelegramFile
   // ──────────────────────────────────────────
   Future<TelegramFile?> resolveLink(String link) async {
+    _errorMessage = '';
     try {
-      _errorMessage = '';
-      final linkInfo = await _sendRequest({
+      final res = await _sendRequest({
         '@type': 'getMessageLinkInfo',
         'url': link,
       });
-
-      if (linkInfo == null) {
+      if (res == null) {
         _errorMessage = 'No response from Telegram';
         notifyListeners();
         return null;
       }
-      if (linkInfo['@type'] == 'error') {
-        _errorMessage = linkInfo['message'] as String? ??
-            'Invalid or inaccessible link';
+      if (res['@type'] == 'error') {
+        _errorMessage = res['message'] as String? ?? 'Invalid link';
         notifyListeners();
         return null;
       }
-
-      final message = linkInfo['message'] as Map<String, dynamic>?;
+      final message = res['message'] as Map<String, dynamic>?;
       if (message == null) {
-        _errorMessage = 'No message found at this link';
+        _errorMessage = 'No message at this link';
         notifyListeners();
         return null;
       }
-
-      final file = _extractFileFromMessage(message);
-      if (file == null && _errorMessage.isEmpty) {
-        _errorMessage = 'This message does not contain a supported file';
-        notifyListeners();
-      }
-      return file;
+      return _extractFile(message);
     } catch (e) {
       _errorMessage = e.toString();
       notifyListeners();
@@ -311,159 +279,161 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  TelegramFile? _extractFileFromMessage(Map<String, dynamic> message) {
+  TelegramFile? _extractFile(Map<String, dynamic> message) {
     final content = message['content'] as Map<String, dynamic>?;
     if (content == null) return null;
-    final contentType = content['@type'] as String?;
+    final type = content['@type'] as String?;
 
-    switch (contentType) {
+    switch (type) {
       case 'messageVideo':
-        final video = content['video'] as Map<String, dynamic>?;
-        if (video == null) return null;
-        final file = video['video'] as Map<String, dynamic>?;
-        if (file == null) return null;
-
-        final width = video['width'] as int? ?? 0;
-        final height = video['height'] as int? ?? 0;
-        final qualities = <VideoQuality>[];
-
-        qualities.add(VideoQuality(
-          label: _heightToLabel(height),
-          width: width,
-          height: height,
-          fileId: (file['id'] as int?) ?? 0,
-          fileSize: (file['size'] as int?) ?? 0,
-          remoteId: (file['remote'] as Map?)?['id'] as String? ?? '',
-        ));
-
-        final alternatives =
-            video['alternative_videos'] as List<dynamic>? ?? [];
-        for (final alt in alternatives) {
-          final altMap = alt as Map<String, dynamic>;
-          final altFile = altMap['video'] as Map<String, dynamic>?;
-          if (altFile == null) continue;
-          final altH = altMap['height'] as int? ?? 0;
-          final altW = altMap['width'] as int? ?? 0;
-          qualities.add(VideoQuality(
-            label: _heightToLabel(altH),
-            width: altW,
-            height: altH,
-            fileId: (altFile['id'] as int?) ?? 0,
-            fileSize: (altFile['size'] as int?) ?? 0,
-            remoteId: (altFile['remote'] as Map?)?['id'] as String? ?? '',
-          ));
-        }
-        qualities.sort((a, b) => b.height.compareTo(a.height));
-
-        return TelegramFile(
-          type: TelegramFileType.video,
-          name: video['file_name'] as String? ?? 'video.mp4',
-          mimeType: video['mime_type'] as String? ?? 'video/mp4',
-          duration: video['duration'] as int? ?? 0,
-          width: width,
-          height: height,
-          fileId: (file['id'] as int?) ?? 0,
-          fileSize: (file['size'] as int?) ?? 0,
-          remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
-          thumbnail: _extractThumbnail(video['thumbnail']),
-          qualities: qualities,
-        );
-
+        return _parseVideo(content);
       case 'messageAudio':
-        final audio = content['audio'] as Map<String, dynamic>?;
-        if (audio == null) return null;
-        final file = audio['audio'] as Map<String, dynamic>?;
-        if (file == null) return null;
-        return TelegramFile(
-          type: TelegramFileType.audio,
-          name: audio['file_name'] as String? ?? 'audio.mp3',
-          mimeType: audio['mime_type'] as String? ?? 'audio/mpeg',
-          duration: audio['duration'] as int? ?? 0,
-          fileId: (file['id'] as int?) ?? 0,
-          fileSize: (file['size'] as int?) ?? 0,
-          remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
-          qualities: [],
-        );
-
+        return _parseAudio(content);
       case 'messageDocument':
-        final doc = content['document'] as Map<String, dynamic>?;
-        if (doc == null) return null;
-        final file = doc['document'] as Map<String, dynamic>?;
-        if (file == null) return null;
-        return TelegramFile(
-          type: TelegramFileType.document,
-          name: doc['file_name'] as String? ?? 'file',
-          mimeType: doc['mime_type'] as String? ?? 'application/octet-stream',
-          fileId: (file['id'] as int?) ?? 0,
-          fileSize: (file['size'] as int?) ?? 0,
-          remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
-          qualities: [],
-        );
-
+        return _parseDocument(content);
       case 'messageVoiceNote':
-        final voice = content['voice_note'] as Map<String, dynamic>?;
-        if (voice == null) return null;
-        final file = voice['voice'] as Map<String, dynamic>?;
-        if (file == null) return null;
-        return TelegramFile(
-          type: TelegramFileType.audio,
-          name: 'voice_note.ogg',
-          mimeType: voice['mime_type'] as String? ?? 'audio/ogg',
-          duration: voice['duration'] as int? ?? 0,
-          fileId: (file['id'] as int?) ?? 0,
-          fileSize: (file['size'] as int?) ?? 0,
-          remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
-          qualities: [],
-        );
-
+        return _parseVoice(content);
       case 'messageVideoNote':
-        final videoNote = content['video_note'] as Map<String, dynamic>?;
-        if (videoNote == null) return null;
-        final file = videoNote['video'] as Map<String, dynamic>?;
-        if (file == null) return null;
-        return TelegramFile(
-          type: TelegramFileType.video,
-          name: 'video_note.mp4',
-          mimeType: 'video/mp4',
-          duration: videoNote['duration'] as int? ?? 0,
-          fileId: (file['id'] as int?) ?? 0,
-          fileSize: (file['size'] as int?) ?? 0,
-          remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
-          qualities: [],
-        );
-
+        return _parseVideoNote(content);
       default:
-        _errorMessage = 'Unsupported file type: $contentType';
+        _errorMessage = 'Unsupported content type: $type';
         notifyListeners();
         return null;
     }
   }
 
-  String _heightToLabel(int height) {
-    if (height >= 2160) return '4K';
-    if (height >= 1440) return '1440p';
-    if (height >= 1080) return '1080p';
-    if (height >= 720) return '720p';
-    if (height >= 480) return '480p';
-    if (height >= 360) return '360p';
-    if (height >= 240) return '240p';
-    return '${height}p';
+  TelegramFile? _parseVideo(Map<String, dynamic> content) {
+    final video = content['video'] as Map<String, dynamic>?;
+    if (video == null) return null;
+    final file = video['video'] as Map<String, dynamic>?;
+    if (file == null) return null;
+
+    final w = video['width'] as int? ?? 0;
+    final h = video['height'] as int? ?? 0;
+    final qualities = <VideoQuality>[
+      VideoQuality(
+        label: _label(h),
+        width: w,
+        height: h,
+        fileId: file['id'] as int? ?? 0,
+        fileSize: file['size'] as int? ?? 0,
+        remoteId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      ),
+    ];
+    for (final alt in (video['alternative_videos'] as List? ?? [])) {
+      final a = alt as Map<String, dynamic>;
+      final af = a['video'] as Map<String, dynamic>?;
+      if (af == null) continue;
+      final ah = a['height'] as int? ?? 0;
+      qualities.add(VideoQuality(
+        label: _label(ah),
+        width: a['width'] as int? ?? 0,
+        height: ah,
+        fileId: af['id'] as int? ?? 0,
+        fileSize: af['size'] as int? ?? 0,
+        remoteId: (af['remote'] as Map?)?['id'] as String? ?? '',
+      ));
+    }
+    qualities.sort((a, b) => b.height.compareTo(a.height));
+
+    return TelegramFile(
+      type: TelegramFileType.video,
+      name: video['file_name'] as String? ?? 'video.mp4',
+      mimeType: video['mime_type'] as String? ?? 'video/mp4',
+      duration: video['duration'] as int? ?? 0,
+      width: w,
+      height: h,
+      fileId: file['id'] as int? ?? 0,
+      fileSize: file['size'] as int? ?? 0,
+      remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      thumbnail: _thumbPath(video['thumbnail']),
+      qualities: qualities,
+    );
   }
 
-  String? _extractThumbnail(dynamic thumbnail) {
-    if (thumbnail == null) return null;
-    final thumbMap = thumbnail as Map<String, dynamic>?;
-    if (thumbMap == null) return null;
-    final file = thumbMap['file'] as Map<String, dynamic>?;
-    if (file == null) return null;
-    final local = file['local'] as Map<String, dynamic>?;
-    return local?['path'] as String?;
+  TelegramFile? _parseAudio(Map<String, dynamic> content) {
+    final audio = content['audio'] as Map<String, dynamic>?;
+    final file = audio?['audio'] as Map<String, dynamic>?;
+    if (audio == null || file == null) return null;
+    return TelegramFile(
+      type: TelegramFileType.audio,
+      name: audio['file_name'] as String? ?? 'audio.mp3',
+      mimeType: audio['mime_type'] as String? ?? 'audio/mpeg',
+      duration: audio['duration'] as int? ?? 0,
+      fileId: file['id'] as int? ?? 0,
+      fileSize: file['size'] as int? ?? 0,
+      remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      qualities: [],
+    );
+  }
+
+  TelegramFile? _parseDocument(Map<String, dynamic> content) {
+    final doc = content['document'] as Map<String, dynamic>?;
+    final file = doc?['document'] as Map<String, dynamic>?;
+    if (doc == null || file == null) return null;
+    return TelegramFile(
+      type: TelegramFileType.document,
+      name: doc['file_name'] as String? ?? 'file',
+      mimeType: doc['mime_type'] as String? ?? 'application/octet-stream',
+      fileId: file['id'] as int? ?? 0,
+      fileSize: file['size'] as int? ?? 0,
+      remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      qualities: [],
+    );
+  }
+
+  TelegramFile? _parseVoice(Map<String, dynamic> content) {
+    final voice = content['voice_note'] as Map<String, dynamic>?;
+    final file = voice?['voice'] as Map<String, dynamic>?;
+    if (voice == null || file == null) return null;
+    return TelegramFile(
+      type: TelegramFileType.audio,
+      name: 'voice_note.ogg',
+      mimeType: voice['mime_type'] as String? ?? 'audio/ogg',
+      duration: voice['duration'] as int? ?? 0,
+      fileId: file['id'] as int? ?? 0,
+      fileSize: file['size'] as int? ?? 0,
+      remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      qualities: [],
+    );
+  }
+
+  TelegramFile? _parseVideoNote(Map<String, dynamic> content) {
+    final vn = content['video_note'] as Map<String, dynamic>?;
+    final file = vn?['video'] as Map<String, dynamic>?;
+    if (vn == null || file == null) return null;
+    return TelegramFile(
+      type: TelegramFileType.video,
+      name: 'video_note.mp4',
+      mimeType: 'video/mp4',
+      duration: vn['duration'] as int? ?? 0,
+      fileId: file['id'] as int? ?? 0,
+      fileSize: file['size'] as int? ?? 0,
+      remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      qualities: [],
+    );
+  }
+
+  String _label(int h) {
+    if (h >= 2160) return '4K';
+    if (h >= 1440) return '1440p';
+    if (h >= 1080) return '1080p';
+    if (h >= 720) return '720p';
+    if (h >= 480) return '480p';
+    if (h >= 360) return '360p';
+    return '${h}p';
+  }
+
+  String? _thumbPath(dynamic t) {
+    if (t == null) return null;
+    final m = t as Map<String, dynamic>?;
+    final f = m?['file'] as Map<String, dynamic>?;
+    return (f?['local'] as Map<String, dynamic>?)?['path'] as String?;
   }
 
   // ──────────────────────────────────────────
-  // Download a byte range of a file for streaming.
-  // Uses RandomAccessFile so only 'count' bytes are in RAM at once,
-  // not the entire file.
+  // Stream a byte range of a file
+  // Uses RandomAccessFile — only 'count' bytes in RAM at once
   // ──────────────────────────────────────────
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -471,7 +441,7 @@ class TelegramService extends ChangeNotifier {
     required int count,
   }) async {
     try {
-      final response = await _sendRequest({
+      final res = await _sendRequest({
         '@type': 'downloadFile',
         'file_id': fileId,
         'priority': 32,
@@ -479,70 +449,74 @@ class TelegramService extends ChangeNotifier {
         'limit': count,
         'synchronous': true,
       });
+      if (res == null || res['@type'] == 'error') return null;
 
-      if (response == null || response['@type'] == 'error') return null;
+      final path =
+          (res['local'] as Map<String, dynamic>?)?['path'] as String?;
+      if (path == null || path.isEmpty) return null;
 
-      final localPath = (response['local'] as Map<String, dynamic>?)?['path']
-          as String?;
-      if (localPath == null || localPath.isEmpty) return null;
+      final f = io.File(path);
+      if (!await f.exists()) return null;
 
-      final ioFile = io.File(localPath);
-      if (!await ioFile.exists()) return null;
-
-      final raf = await ioFile.open();
+      final raf = await f.open();
       try {
-        final fileLength = await raf.length();
-        if (offset >= fileLength) return Uint8List(0);
+        final len = await raf.length();
+        if (offset >= len) return Uint8List(0);
         await raf.setPosition(offset);
-        final bytesToRead = count.clamp(0, fileLength - offset);
-        return await raf.read(bytesToRead);
+        return await raf.read(count.clamp(0, len - offset));
       } finally {
         await raf.close();
       }
     } catch (e) {
-      debugPrint('downloadFilePart error: $e');
+      debugPrint('downloadFilePart: $e');
       return null;
     }
   }
 
   Future<int> getFileSize(int fileId) async {
     try {
-      final response = await _sendRequest({
-        '@type': 'getFile',
-        'file_id': fileId,
-      });
-      if (response == null || response['@type'] == 'error') return 0;
-      return (response['size'] as int?) ??
-          (response['expected_size'] as int?) ??
-          0;
+      final res = await _sendRequest({'@type': 'getFile', 'file_id': fileId});
+      if (res == null || res['@type'] == 'error') return 0;
+      return (res['size'] as int?) ?? (res['expected_size'] as int?) ?? 0;
     } catch (_) {
       return 0;
     }
   }
 
   // ──────────────────────────────────────────
-  // Send a request to TDLib and await its response
-  // Matches on @extra field echoed back by TDLib
+  // Low-level send/receive
   // ──────────────────────────────────────────
+
+  /// Fire-and-forget send — used for setTdlibParameters before
+  /// the receive loop is ready to match @extra fields.
+  void _sendRaw(Map<String, dynamic> req) {
+    if (_clientId == null) return;
+    try {
+      TdPlugin.instance.tdSend(_clientId!, json.encode(req));
+    } catch (e) {
+      debugPrint('_sendRaw error: $e');
+    }
+  }
+
+  /// Send a request and await the matching response via @extra.
   Future<Map<String, dynamic>?> _sendRequest(
-      Map<String, dynamic> request) async {
+      Map<String, dynamic> req) async {
     if (_clientId == null) return null;
 
-    final requestId = '${DateTime.now().microsecondsSinceEpoch}';
-    request['@extra'] = requestId;
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    req['@extra'] = id;
 
     final completer = Completer<Map<String, dynamic>?>();
     late StreamSubscription sub;
-
-    sub = _updateController.stream.listen((update) {
-      if (update['@extra'] == requestId) {
-        if (!completer.isCompleted) completer.complete(update);
+    sub = _updateController.stream.listen((u) {
+      if (u['@extra'] == id && !completer.isCompleted) {
+        completer.complete(u);
         sub.cancel();
       }
     });
 
     try {
-      TdPlugin.instance.tdSend(_clientId!, json.encode(request));
+      TdPlugin.instance.tdSend(_clientId!, json.encode(req));
     } catch (e) {
       sub.cancel();
       debugPrint('tdSend error: $e');
@@ -553,7 +527,7 @@ class TelegramService extends ChangeNotifier {
       const Duration(seconds: 30),
       onTimeout: () {
         sub.cancel();
-        debugPrint('TDLib request timed out: ${request['@type']}');
+        debugPrint('Request timeout: ${req['@type']}');
         return null;
       },
     );
