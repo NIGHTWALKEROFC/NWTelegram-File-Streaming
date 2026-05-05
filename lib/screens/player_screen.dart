@@ -23,15 +23,14 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // Video
   VideoPlayerController? _videoController;
   ChewieController? _chewieController;
-
-  // Audio
   AudioPlayer? _audioPlayer;
 
   bool _isInitializing = true;
   String? _initError;
+
+  // Audio state
   bool _isAudioPlaying = false;
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
@@ -39,11 +38,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
-    _initPlayer();
+    // Brief delay to let the local proxy server finish binding
+    // before the player makes its first HTTP connection.
+    Future.delayed(const Duration(milliseconds: 400), _initPlayer);
   }
 
   Future<void> _initPlayer() async {
-    setState(() => _isInitializing = true);
+    if (!mounted) return;
+    setState(() {
+      _isInitializing = true;
+      _initError = null;
+    });
+
+    // Dispose any previous player instances on retry
+    _disposeControllers();
 
     try {
       if (widget.file.isVideo) {
@@ -52,18 +60,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await _initAudioPlayer();
       }
     } catch (e) {
+      debugPrint('PlayerScreen init error: $e');
       if (mounted) {
         setState(() {
           _isInitializing = false;
-          _initError = 'Failed to start player: $e';
+          _initError = 'Failed to start player:\n$e';
         });
       }
       return;
     }
 
-    if (mounted) {
-      setState(() => _isInitializing = false);
-    }
+    if (mounted) setState(() => _isInitializing = false);
   }
 
   Future<void> _initVideoPlayer() async {
@@ -77,11 +84,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       },
     );
 
+    // Listen for video player errors so we surface them instead of crashing
+    _videoController!.addListener(_onVideoPlayerUpdate);
+
     await _videoController!.initialize();
 
-    // Determine video quality label for display
+    if (!mounted) return;
+
     final qualityLabel = widget.selectedQuality?.label ??
-        (widget.file.height > 0 ? '${widget.file.height}p' : 'Auto');
+        (widget.file.height > 0 ? '${widget.file.height}p' : '');
 
     _chewieController = ChewieController(
       videoPlayerController: _videoController!,
@@ -97,38 +108,48 @@ class _PlayerScreenState extends State<PlayerScreen> {
         DeviceOrientation.landscapeLeft,
         DeviceOrientation.landscapeRight,
       ],
-      customControls: const MaterialControls(),
       materialProgressColors: ChewieProgressColors(
         playedColor: const Color(0xFF2AABEE),
         handleColor: const Color(0xFF2AABEE),
         backgroundColor: const Color(0xFF3A3A5A),
         bufferedColor: const Color(0xFF2AABEE).withOpacity(0.3),
       ),
-      overlay: Positioned(
-        top: 12,
-        right: 12,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-            color: Colors.black.withOpacity(0.6),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Text(
-            qualityLabel,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-      ),
+      // Quality badge shown over the player
+      overlay: qualityLabel.isNotEmpty
+          ? Positioned(
+              top: 12,
+              right: 12,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  qualityLabel,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            )
+          : null,
     );
+  }
+
+  void _onVideoPlayerUpdate() {
+    final value = _videoController?.value;
+    if (value == null) return;
+    if (value.hasError && _initError == null && mounted) {
+      setState(() => _initError = value.errorDescription ?? 'Video error');
+    }
   }
 
   Future<void> _initAudioPlayer() async {
     _audioPlayer = AudioPlayer();
-    await _audioPlayer!.setUrl(widget.streamUrl);
 
     _audioPlayer!.durationStream.listen((d) {
       if (d != null && mounted) setState(() => _audioDuration = d);
@@ -140,17 +161,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (mounted) setState(() => _isAudioPlaying = playing);
     });
 
+    await _audioPlayer!.setUrl(widget.streamUrl);
     await _audioPlayer!.play();
+  }
+
+  void _disposeControllers() {
+    _videoController?.removeListener(_onVideoPlayerUpdate);
+    _chewieController?.dispose();
+    _chewieController = null;
+    _videoController?.dispose();
+    _videoController = null;
+    _audioPlayer?.dispose();
+    _audioPlayer = null;
   }
 
   @override
   void dispose() {
-    _videoController?.dispose();
-    _chewieController?.dispose();
-    _audioPlayer?.dispose();
+    _disposeControllers();
     super.dispose();
   }
 
+  // ──────────────────────────────────────────
+  // Build
+  // ──────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -181,7 +214,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            CircularProgressIndicator(color: Color(0xFF2AABEE)),
+            CircularProgressIndicator(color: Color(0xFF2AABEE), strokeWidth: 2),
             SizedBox(height: 20),
             Text(
               'Connecting to stream...',
@@ -192,62 +225,64 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
     }
 
-    if (_initError != null) {
-      return _buildErrorView();
-    }
+    if (_initError != null) return _buildErrorView();
 
-    if (widget.file.isVideo) {
-      return _buildVideoPlayer();
-    } else if (widget.file.isAudio) {
-      return _buildAudioPlayer();
-    }
-
+    if (widget.file.isVideo) return _buildVideoPlayer();
+    if (widget.file.isAudio) return _buildAudioPlayer();
     return _buildDocumentView();
   }
 
   Widget _buildVideoPlayer() {
-    if (_chewieController == null) {
+    final controller = _chewieController;
+    final videoValue = _videoController?.value;
+
+    // Guard: if controller isn't ready or aspect ratio is invalid, show spinner
+    if (controller == null ||
+        videoValue == null ||
+        !videoValue.isInitialized ||
+        videoValue.aspectRatio <= 0) {
       return const Center(
-        child: Text('Video player not ready',
-            style: TextStyle(color: Colors.white)),
+        child: CircularProgressIndicator(
+            color: Color(0xFF2AABEE), strokeWidth: 2),
       );
     }
 
-    return SafeArea(
-      child: Stack(
-        children: [
-          Center(
-            child: AspectRatio(
-              aspectRatio: _videoController!.value.aspectRatio,
-              child: Chewie(controller: _chewieController!),
-            ),
+    return Stack(
+      children: [
+        // Full-screen video
+        Center(
+          child: AspectRatio(
+            aspectRatio: videoValue.aspectRatio,
+            child: Chewie(controller: controller),
           ),
-          // Back button overlay (shown briefly)
-          Positioned(
-            top: 8,
-            left: 8,
-            child: SafeArea(
-              child: GestureDetector(
-                onTap: () => Navigator.pop(context),
-                child: Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.5),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
+        ),
+        // Back button overlay
+        Positioned(
+          top: 8,
+          left: 8,
+          child: SafeArea(
+            child: GestureDetector(
+              onTap: () => Navigator.pop(context),
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.5),
+                  borderRadius: BorderRadius.circular(8),
                 ),
+                child: const Icon(Icons.arrow_back,
+                    color: Colors.white, size: 20),
               ),
             ),
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
   Widget _buildAudioPlayer() {
     final progress = _audioDuration.inMilliseconds > 0
-        ? _audioPosition.inMilliseconds / _audioDuration.inMilliseconds
+        ? (_audioPosition.inMilliseconds / _audioDuration.inMilliseconds)
+            .clamp(0.0, 1.0)
         : 0.0;
 
     return Container(
@@ -256,7 +291,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          // Album art placeholder
+          // Album art
           Container(
             width: 200,
             height: 200,
@@ -275,11 +310,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
               ],
             ),
-            child: const Icon(
-              Icons.music_note_rounded,
-              color: Colors.white,
-              size: 80,
-            ),
+            child: const Icon(Icons.music_note_rounded,
+                color: Colors.white, size: 80),
           ),
 
           const SizedBox(height: 40),
@@ -287,10 +319,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Text(
             widget.file.name,
             style: const TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-            ),
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w600),
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
@@ -303,7 +334,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 32),
 
-          // Progress bar
+          // Progress slider
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
               activeTrackColor: const Color(0xFF9B59B6),
@@ -313,37 +344,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
               thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
             ),
             child: Slider(
-              value: progress.clamp(0.0, 1.0),
+              value: progress,
               onChanged: (v) {
-                final position = Duration(
-                  milliseconds: (v * _audioDuration.inMilliseconds).round(),
+                final pos = Duration(
+                  milliseconds:
+                      (v * _audioDuration.inMilliseconds).round(),
                 );
-                _audioPlayer?.seek(position);
+                _audioPlayer?.seek(pos);
               },
             ),
           ),
 
-          // Time labels
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  _formatDuration(_audioPosition),
-                  style: const TextStyle(color: Color(0xFF9090B0), fontSize: 12),
-                ),
-                Text(
-                  _formatDuration(_audioDuration),
-                  style: const TextStyle(color: Color(0xFF9090B0), fontSize: 12),
-                ),
+                Text(_formatDuration(_audioPosition),
+                    style: const TextStyle(
+                        color: Color(0xFF9090B0), fontSize: 12)),
+                Text(_formatDuration(_audioDuration),
+                    style: const TextStyle(
+                        color: Color(0xFF9090B0), fontSize: 12)),
               ],
             ),
           ),
 
           const SizedBox(height: 24),
 
-          // Controls
+          // Playback controls
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -351,19 +380,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 iconSize: 32,
                 icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
                 onPressed: () {
-                  final pos = _audioPosition - const Duration(seconds: 10);
-                  _audioPlayer?.seek(pos < Duration.zero ? Duration.zero : pos);
+                  final pos =
+                      _audioPosition - const Duration(seconds: 10);
+                  _audioPlayer?.seek(
+                      pos < Duration.zero ? Duration.zero : pos);
                 },
               ),
               const SizedBox(width: 16),
               GestureDetector(
-                onTap: () {
-                  if (_isAudioPlaying) {
-                    _audioPlayer?.pause();
-                  } else {
-                    _audioPlayer?.play();
-                  }
-                },
+                onTap: () => _isAudioPlaying
+                    ? _audioPlayer?.pause()
+                    : _audioPlayer?.play(),
                 child: Container(
                   width: 72,
                   height: 72,
@@ -390,9 +417,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
               const SizedBox(width: 16),
               IconButton(
                 iconSize: 32,
-                icon: const Icon(Icons.forward_30_rounded, color: Colors.white),
+                icon:
+                    const Icon(Icons.forward_30_rounded, color: Colors.white),
                 onPressed: () {
-                  final pos = _audioPosition + const Duration(seconds: 30);
+                  final pos =
+                      _audioPosition + const Duration(seconds: 30);
                   _audioPlayer?.seek(
                       pos > _audioDuration ? _audioDuration : pos);
                 },
@@ -418,35 +447,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 color: const Color(0xFF27AE60).withOpacity(0.15),
                 borderRadius: BorderRadius.circular(24),
               ),
-              child: const Icon(
-                Icons.insert_drive_file_rounded,
-                color: Color(0xFF27AE60),
-                size: 52,
-              ),
+              child: const Icon(Icons.insert_drive_file_rounded,
+                  color: Color(0xFF27AE60), size: 52),
             ),
             const SizedBox(height: 24),
             Text(
               widget.file.name,
               style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
-              ),
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
-            Text(
-              widget.file.readableSize,
-              style: const TextStyle(color: Color(0xFF9090B0), fontSize: 14),
-            ),
+            Text(widget.file.readableSize,
+                style: const TextStyle(
+                    color: Color(0xFF9090B0), fontSize: 14)),
             const SizedBox(height: 32),
             const Text(
               'Document streaming is not supported in the player.\nThe file can be opened in a browser via the stream URL.',
               style: TextStyle(
-                color: Color(0xFF7070A0),
-                fontSize: 14,
-                height: 1.5,
-              ),
+                  color: Color(0xFF7070A0), fontSize: 14, height: 1.5),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 24),
@@ -467,24 +488,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(
-              Icons.error_outline_rounded,
-              color: Color(0xFFCF6679),
-              size: 64,
-            ),
+            const Icon(Icons.error_outline_rounded,
+                color: Color(0xFFCF6679), size: 64),
             const SizedBox(height: 20),
-            const Text(
-              'Playback Error',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 20,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
+            const Text('Playback Error',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600)),
             const SizedBox(height: 10),
             Text(
               _initError ?? 'Unknown error occurred',
-              style: const TextStyle(color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
+              style: const TextStyle(
+                  color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 28),
