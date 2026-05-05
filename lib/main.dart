@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -8,7 +10,20 @@ import 'screens/login_screen.dart';
 import 'screens/home_screen.dart';
 
 void main() async {
+  // Must be first — required before any platform channel or plugin call
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Catch all Flutter framework errors (widget build errors, etc.)
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    debugPrint('FlutterError: ${details.exceptionAsString()}');
+  };
+
+  // Catch all errors outside the Flutter framework (async errors, isolate errors)
+  PlatformDispatcher.instance.onError = (error, stack) {
+    debugPrint('PlatformDispatcher error: $error\n$stack');
+    return true; // return true = handled, prevents app crash
+  };
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
@@ -44,12 +59,11 @@ class TelegramStreamerApp extends StatelessWidget {
       title: 'TG Streamer',
       debugShowCheckedModeBanner: false,
       theme: _buildDarkTheme(),
-      // Named route for '/' so logout can pushReplacementNamed('/')
       initialRoute: '/',
       routes: {
         '/': (_) => const SplashRouter(),
-        '/home': (_) => const HomeScreen(),
         '/login': (_) => const LoginScreen(),
+        '/home': (_) => const HomeScreen(),
       },
     );
   }
@@ -114,6 +128,11 @@ class TelegramStreamerApp extends StatelessWidget {
   }
 }
 
+// ──────────────────────────────────────────────────────────
+// SplashRouter
+// Shows animated splash, initializes TDLib, then routes to
+// LoginScreen or HomeScreen based on auth state.
+// ──────────────────────────────────────────────────────────
 class SplashRouter extends StatefulWidget {
   const SplashRouter({super.key});
 
@@ -123,11 +142,9 @@ class SplashRouter extends StatefulWidget {
 
 class _SplashRouterState extends State<SplashRouter>
     with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _fadeAnim;
-  late Animation<double> _scaleAnim;
-
-  // Shown when TDLib fails to initialize (e.g. device not supported)
+  late final AnimationController _controller;
+  late final Animation<double> _fadeAnim;
+  late final Animation<double> _scaleAnim;
   String? _initError;
 
   @override
@@ -137,43 +154,40 @@ class _SplashRouterState extends State<SplashRouter>
       vsync: this,
       duration: const Duration(milliseconds: 1200),
     );
-    _fadeAnim = CurvedAnimation(parent: _controller, curve: Curves.easeIn);
-    _scaleAnim = Tween<double>(begin: 0.8, end: 1.0).animate(
+    _fadeAnim =
+        CurvedAnimation(parent: _controller, curve: Curves.easeIn);
+    _scaleAnim = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(parent: _controller, curve: Curves.elasticOut),
     );
     _controller.forward();
-    _checkSession();
+
+    // Delay init until after the first frame so the plugin registry
+    // is fully set up — prevents MissingPluginException on cold start.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _init());
   }
 
-  Future<void> _checkSession() async {
-    // Brief splash delay so the animation has time to play
-    await Future.delayed(const Duration(milliseconds: 1800));
+  Future<void> _init() async {
+    // Show splash for at least 1.5 s so the animation completes
+    await Future.delayed(const Duration(milliseconds: 1500));
     if (!mounted) return;
 
     try {
-      final telegramService = context.read<TelegramService>();
-
-      // initialize() catches its own internal errors and sets AuthState.error,
-      // but we also wrap here to catch any unexpected native crash from TDLib.
-      await telegramService.initialize();
-
+      final svc = context.read<TelegramService>();
+      await svc.initialize();
       if (!mounted) return;
 
-      if (telegramService.authState == AuthState.error) {
-        // TDLib reported an error — show it instead of crashing
-        setState(() => _initError = telegramService.errorMessage);
+      if (svc.authState == AuthState.error) {
+        setState(() => _initError =
+            svc.errorMessage.isNotEmpty ? svc.errorMessage : 'Unknown error');
         return;
       }
 
-      if (telegramService.isLoggedIn) {
-        Navigator.of(context).pushReplacementNamed('/home');
-      } else {
-        Navigator.of(context).pushReplacementNamed('/login');
-      }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() =>
-          _initError = 'Initialization failed:\n${e.toString()}');
+      Navigator.of(context).pushReplacementNamed(
+        svc.isLoggedIn ? '/home' : '/login',
+      );
+    } catch (e, stack) {
+      debugPrint('SplashRouter._init error: $e\n$stack');
+      if (mounted) setState(() => _initError = e.toString());
     }
   }
 
@@ -185,48 +199,11 @@ class _SplashRouterState extends State<SplashRouter>
 
   @override
   Widget build(BuildContext context) {
-    // Show error screen instead of crashing if TDLib init failed
-    if (_initError != null) {
-      return Scaffold(
-        backgroundColor: const Color(0xFF0A0A0F),
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.error_outline,
-                    color: Color(0xFFCF6679), size: 64),
-                const SizedBox(height: 24),
-                const Text(
-                  'Failed to start',
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 22,
-                      fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  _initError!,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                      color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
-                ),
-                const SizedBox(height: 32),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() => _initError = null);
-                    _checkSession();
-                  },
-                  child: const Text('Retry'),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
+    if (_initError != null) return _buildErrorScreen();
+    return _buildSplash();
+  }
 
+  Widget _buildSplash() {
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0F),
       body: Center(
@@ -282,8 +259,8 @@ class _SplashRouterState extends State<SplashRouter>
                 ),
                 const SizedBox(height: 48),
                 const SizedBox(
-                  width: 32,
-                  height: 32,
+                  width: 28,
+                  height: 28,
                   child: CircularProgressIndicator(
                     strokeWidth: 2,
                     color: Color(0xFF2AABEE),
@@ -291,6 +268,49 @@ class _SplashRouterState extends State<SplashRouter>
                 ),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildErrorScreen() {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0A0F),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.error_outline_rounded,
+                  color: Color(0xFFCF6679), size: 64),
+              const SizedBox(height: 24),
+              const Text(
+                'Failed to Start',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _initError!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    color: Color(0xFF9090B0), fontSize: 13, height: 1.5),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                onPressed: () {
+                  setState(() => _initError = null);
+                  WidgetsBinding.instance
+                      .addPostFrameCallback((_) => _init());
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+            ],
           ),
         ),
       ),
