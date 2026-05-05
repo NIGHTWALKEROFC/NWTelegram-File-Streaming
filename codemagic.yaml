@@ -1,3 +1,5 @@
+# codemagic.yaml
+
 workflows:
   android-release:
     name: Android Release Build
@@ -5,6 +7,9 @@ workflows:
 
     environment:
       flutter: stable
+      # FIX: Gradle 8.13 + AGP 8.9 require Java 17 explicitly.
+      # Without this, Codemagic may pick Java 11 and the build fails.
+      java: 17
       groups:
         - telegram_keys
 
@@ -18,10 +23,6 @@ workflows:
           source: true
 
     scripts:
-      # ── 1. Flutter setup ──────────────────────────────────────────────────
-      # NOTE: No sed injection needed anymore.
-      # API keys are passed directly at build time via --dart-define below.
-
       - name: Get Flutter packages
         script: |
           flutter pub get
@@ -30,7 +31,6 @@ workflows:
         script: |
           flutter analyze --no-fatal-infos || true
 
-      # ── 2. Build ──────────────────────────────────────────────────────────
       - name: Build Android APK (release)
         script: |
           flutter build apk \
