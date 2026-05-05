@@ -1,5 +1,4 @@
 // android/app/build.gradle
-// THIS FILE WAS MISSING FROM YOUR REPO — primary crash cause
 
 plugins {
     id "com.android.application"
@@ -11,8 +10,8 @@ android {
     namespace "com.nightwalker.telegram_streamer"
     compileSdk flutter.compileSdkVersion
 
-    // handy_tdlib requires NDK 27
-    ndkVersion "27.0.12077973"
+    // FIX: Use latest NDK — backward compatible with handy_tdlib
+    ndkVersion "28.2.13676358"
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -33,7 +32,6 @@ android {
 
     buildTypes {
         release {
-            // Use debug signing for now — replace with your keystore when publishing
             signingConfig signingConfigs.debug
             minifyEnabled false
             shrinkResources false
