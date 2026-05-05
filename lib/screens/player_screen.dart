@@ -1,5 +1,7 @@
 // lib/screens/player_screen.dart
 
+import 'dart:async'; // FIX: Missing import — StreamSubscription lives here
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -36,8 +38,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
 
-  // FIX: Store subscriptions so we can cancel on dispose — previously these
-  // were anonymous and leaked, causing setState on disposed widget crashes.
   final List<StreamSubscription<dynamic>> _audioSubs = [];
 
   @override
@@ -94,10 +94,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final qualityLabel = widget.selectedQuality?.label ??
         (widget.file.height > 0 ? '${widget.file.height}p' : '');
 
-    // FIX: Chewie's overlay must NOT be a Positioned widget — Positioned can
-    // only live directly inside a Stack. Using it as overlay caused a
-    // "Positioned widget must be inside a Stack" fatal error on some devices.
-    // Use Align instead, which works anywhere.
     Widget? overlayWidget;
     if (qualityLabel.isNotEmpty) {
       overlayWidget = Align(
@@ -179,7 +175,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _disposeControllers() {
-    // FIX: Cancel audio subscriptions BEFORE disposing the player
     for (final sub in _audioSubs) {
       sub.cancel();
     }
@@ -187,8 +182,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     _videoController?.removeListener(_onVideoPlayerUpdate);
 
-    // FIX: Dispose Chewie BEFORE VideoPlayerController — wrong order causes
-    // "VideoPlayerController was disposed" crash inside Chewie internals.
     _chewieController?.dispose();
     _chewieController = null;
     _videoController?.dispose();
@@ -200,7 +193,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
-    // FIX: Force portrait when leaving so the UI doesn't stay stuck in landscape
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
@@ -209,9 +201,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.dispose();
   }
 
-  // ──────────────────────────────────────────
-  // Build
-  // ──────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -293,7 +282,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   color: Colors.black.withOpacity(0.5),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
+                child: const Icon(Icons.arrow_back,
+                    color: Colors.white, size: 20),
               ),
             ),
           ),
@@ -339,7 +329,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Text(
             widget.file.name,
             style: const TextStyle(
-                color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w600),
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
@@ -362,7 +354,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
               value: progress.toDouble(),
               onChanged: (v) {
                 final pos = Duration(
-                  milliseconds: (v * _audioDuration.inMilliseconds).round(),
+                  milliseconds:
+                      (v * _audioDuration.inMilliseconds).round(),
                 );
                 _audioPlayer?.seek(pos);
               },
@@ -390,7 +383,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 iconSize: 32,
                 icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
                 onPressed: () {
-                  final pos = _audioPosition - const Duration(seconds: 10);
+                  final pos =
+                      _audioPosition - const Duration(seconds: 10);
                   _audioPlayer?.seek(
                       pos < Duration.zero ? Duration.zero : pos);
                 },
@@ -428,7 +422,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 iconSize: 32,
                 icon: const Icon(Icons.forward_30_rounded, color: Colors.white),
                 onPressed: () {
-                  final pos = _audioPosition + const Duration(seconds: 30);
+                  final pos =
+                      _audioPosition + const Duration(seconds: 30);
                   _audioPlayer?.seek(
                       pos > _audioDuration ? _audioDuration : pos);
                 },
@@ -468,8 +463,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
             const SizedBox(height: 8),
             Text(widget.file.readableSize,
-                style:
-                    const TextStyle(color: Color(0xFF9090B0), fontSize: 14)),
+                style: const TextStyle(
+                    color: Color(0xFF9090B0), fontSize: 14)),
             const SizedBox(height: 32),
             const Text(
               'Document streaming is not supported in the player.\nThe file can be opened in a browser via the stream URL.',
