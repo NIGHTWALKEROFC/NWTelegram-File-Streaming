@@ -18,16 +18,10 @@ workflows:
           source: true
 
     scripts:
-      # ── 1. Inject API credentials ────────────────────────────────────────
-      - name: Inject Telegram API credentials
-        script: |
-          sed -i "s/const int kApiId = 12345678;/const int kApiId = ${TG_API_ID};/" \
-            lib/services/telegram_service.dart
-          sed -i "s/const String kApiHash = 'your_api_hash_here';/const String kApiHash = '${TG_API_HASH}';/" \
-            lib/services/telegram_service.dart
-          echo "API credentials injected."
+      # ── 1. Flutter setup ──────────────────────────────────────────────────
+      # NOTE: No sed injection needed anymore.
+      # API keys are passed directly at build time via --dart-define below.
 
-      # ── 2. Flutter setup ──────────────────────────────────────────────────
       - name: Get Flutter packages
         script: |
           flutter pub get
@@ -36,12 +30,14 @@ workflows:
         script: |
           flutter analyze --no-fatal-infos || true
 
-      # ── 3. Build ──────────────────────────────────────────────────────────
+      # ── 2. Build ──────────────────────────────────────────────────────────
       - name: Build Android APK (release)
         script: |
           flutter build apk \
             --release \
             --split-per-abi \
+            --dart-define=TG_API_ID=${TG_API_ID} \
+            --dart-define=TG_API_HASH=${TG_API_HASH} \
             --build-name="1.0.0" \
             --build-number=$BUILD_NUMBER
 
@@ -49,6 +45,8 @@ workflows:
         script: |
           flutter build appbundle \
             --release \
+            --dart-define=TG_API_ID=${TG_API_ID} \
+            --dart-define=TG_API_HASH=${TG_API_HASH} \
             --build-name="1.0.0" \
             --build-number=$BUILD_NUMBER
 
