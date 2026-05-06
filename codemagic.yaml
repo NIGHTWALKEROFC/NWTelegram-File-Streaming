@@ -1,15 +1,20 @@
 # codemagic.yaml
 
 workflows:
-  android-release:
-    name: Android Release Build
-    max_build_duration: 60
+  android-apk:
+    name: Android APK Build
+    max_build_duration: 30
 
     environment:
       flutter: stable
       java: 17
       groups:
         - telegram_keys
+
+    cache:
+      cache_paths:
+        - ~/.pub-cache
+        - ~/.gradle/caches
 
     triggering:
       events:
@@ -22,31 +27,9 @@ workflows:
 
     scripts:
       - name: Get Flutter packages
-        script: |
-          flutter pub get
+        script: flutter pub get
 
-      - name: Analyze code
-        script: |
-          flutter analyze --no-fatal-infos || true
-
-      # FIX: Removed --split-per-abi from both builds.
-      #
-      # --split-per-abi produces THREE separate APK files:
-      #   app-arm64-v8a-release.apk    ← correct for Samsung A05s
-      #   app-armeabi-v7a-release.apk  ← 32-bit, CRASHES on 64-bit devices
-      #   app-x86_64-release.apk       ← emulator only
-      #
-      # If you install the wrong one (armeabi-v7a on a 64-bit phone) the
-      # app opens the splash screen and immediately crashes because
-      # libtdjni.so built for arm64 is not found.
-      #
-      # Building WITHOUT --split-per-abi produces ONE universal APK that
-      # includes all supported ABIs and always installs correctly.
-      #
-      # The AAB (App Bundle) for Play Store handles ABI splitting
-      # automatically on the server side — safe to keep for AAB.
-
-      - name: Build Android APK (release)
+      - name: Build APK (release)
         script: |
           flutter build apk \
             --release \
@@ -55,19 +38,8 @@ workflows:
             --build-name="1.0.0" \
             --build-number=$BUILD_NUMBER
 
-      - name: Build Android App Bundle (AAB)
-        script: |
-          flutter build appbundle \
-            --release \
-            --dart-define=TG_API_ID=${TG_API_ID} \
-            --dart-define=TG_API_HASH=${TG_API_HASH} \
-            --build-name="1.0.0" \
-            --build-number=$BUILD_NUMBER
-
     artifacts:
-      - build/app/outputs/flutter-apk/*.apk
-      - build/app/outputs/bundle/release/*.aab
-      - flutter_drive.log
+      - build/app/outputs/flutter-apk/app-release.apk
 
     publishing:
       email:
