@@ -1,8 +1,8 @@
 # codemagic.yaml
 
 workflows:
-  android-apk:
-    name: Android APK Build
+  android-release:
+    name: Android Release Build
     max_build_duration: 30
 
     environment:
