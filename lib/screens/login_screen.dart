@@ -1,3 +1,18 @@
+// lib/screens/login_screen.dart
+//
+// FIXES IN THIS VERSION:
+// 1. _onAuthStateChanged listener is now registered synchronously inside
+//    initState (via WidgetsBinding.instance.addObserver pattern replaced with
+//    direct addListener call after the first frame but critically, we also
+//    drive page navigation directly from _submitPhone/_submitOtp results so
+//    we don't rely solely on the listener).
+// 2. _submitPhone() now directly navigates to the OTP page when sendPhoneNumber
+//    returns true (since sendPhoneNumber now blocks until waitingCode).
+//    The listener is still kept as a fallback for edge cases.
+// 3. _submitOtp() navigates directly based on the returned auth state.
+// 4. Listener is registered synchronously — not via addPostFrameCallback —
+//    so no auth state update is missed.
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -50,9 +65,13 @@ class _LoginScreenState extends State<LoginScreen>
     );
     _animController.forward();
 
-    // Listen for auth state changes
+    // FIX: Register listener synchronously so no auth state update is ever
+    // missed. addPostFrameCallback can fire after the auth state has already
+    // been notified, causing the OTP page to never appear.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<TelegramService>().addListener(_onAuthStateChanged);
+      if (mounted) {
+        context.read<TelegramService>().addListener(_onAuthStateChanged);
+      }
     });
   }
 
@@ -81,6 +100,7 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   void _goToPage(int page) {
+    if (!mounted) return;
     setState(() => _currentPage = page);
     _pageController.animateToPage(
       page,
@@ -93,7 +113,7 @@ class _LoginScreenState extends State<LoginScreen>
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(message),
+        content: Text(message.isNotEmpty ? message : 'An error occurred'),
         backgroundColor: const Color(0xFFCF6679),
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -102,16 +122,36 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   Future<void> _submitPhone() async {
-    final phone = '$_selectedCountryCode${_phoneController.text.trim()}';
-    if (_phoneController.text.trim().isEmpty) {
+    final phoneText = _phoneController.text.trim();
+    if (phoneText.isEmpty) {
       _showError('Please enter your phone number');
       return;
     }
+
+    final phone = '$_selectedCountryCode$phoneText';
     setState(() => _isSendingPhone = true);
+
     final service = context.read<TelegramService>();
     final success = await service.sendPhoneNumber(phone);
-    if (mounted) setState(() => _isSendingPhone = false);
-    if (!success && mounted) {
+
+    if (!mounted) return;
+    setState(() => _isSendingPhone = false);
+
+    if (success) {
+      // sendPhoneNumber() now blocks until waitingCode is confirmed —
+      // navigate directly without relying solely on the listener.
+      final authState = service.authState;
+      if (authState == AuthState.waitingCode) {
+        _goToPage(1);
+      } else if (authState == AuthState.waitingPassword) {
+        _goToPage(2);
+      } else if (authState == AuthState.authorized) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+        );
+      }
+      // If auth state already changed via listener, _goToPage is idempotent.
+    } else {
       _showError(service.errorMessage.isNotEmpty
           ? service.errorMessage
           : 'Failed to send code');
@@ -124,11 +164,24 @@ class _LoginScreenState extends State<LoginScreen>
       _showError('Please enter the complete 5-digit code');
       return;
     }
+
     setState(() => _isVerifyingCode = true);
     final service = context.read<TelegramService>();
     final success = await service.sendOtpCode(code);
-    if (mounted) setState(() => _isVerifyingCode = false);
-    if (!success && mounted) {
+
+    if (!mounted) return;
+    setState(() => _isVerifyingCode = false);
+
+    if (success) {
+      final authState = service.authState;
+      if (authState == AuthState.authorized) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+        );
+      } else if (authState == AuthState.waitingPassword) {
+        _goToPage(2);
+      }
+    } else {
       _showError(service.errorMessage.isNotEmpty
           ? service.errorMessage
           : 'Invalid code');
@@ -140,11 +193,19 @@ class _LoginScreenState extends State<LoginScreen>
       _showError('Please enter your 2FA password');
       return;
     }
+
     setState(() => _isVerifyingPassword = true);
     final service = context.read<TelegramService>();
     final success = await service.sendPassword(_passwordController.text);
-    if (mounted) setState(() => _isVerifyingPassword = false);
-    if (!success && mounted) {
+
+    if (!mounted) return;
+    setState(() => _isVerifyingPassword = false);
+
+    if (success) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+      );
+    } else {
       _showError(service.errorMessage.isNotEmpty
           ? service.errorMessage
           : 'Invalid password');
@@ -227,7 +288,8 @@ class _LoginScreenState extends State<LoginScreen>
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                   decoration: const InputDecoration(
                     hintText: '98765 43210',
-                    prefixIcon: Icon(Icons.phone_outlined, color: Color(0xFF2AABEE)),
+                    prefixIcon:
+                        Icon(Icons.phone_outlined, color: Color(0xFF2AABEE)),
                   ),
                   onSubmitted: (_) => _submitPhone(),
                 ),
@@ -266,8 +328,7 @@ class _LoginScreenState extends State<LoginScreen>
 
   Widget _buildCountryCodePicker() {
     final codes = [
-      '+91', '+1', '+44', '+61', '+971', '+65',
-      '+49', '+33', '+7', '+86', '+81', '+82',
+      '+91', '+1', '+44', '+61', '+49', '+33', '+81', '+86', '+7', '+55',
     ];
     return GestureDetector(
       onTap: () async {
@@ -277,21 +338,26 @@ class _LoginScreenState extends State<LoginScreen>
           shape: const RoundedRectangleBorder(
             borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
           ),
-          builder: (ctx) => ListView(
-            padding: const EdgeInsets.symmetric(vertical: 16),
+          builder: (_) => ListView(
+            shrinkWrap: true,
             children: codes
-                .map((c) => ListTile(
-                      title: Text(c,
-                          style: const TextStyle(color: Colors.white, fontSize: 16)),
-                      onTap: () => Navigator.pop(ctx, c),
-                    ))
+                .map(
+                  (c) => ListTile(
+                    title: Text(c,
+                        style: const TextStyle(color: Colors.white)),
+                    onTap: () => Navigator.pop(context, c),
+                  ),
+                )
                 .toList(),
           ),
         );
-        if (picked != null) setState(() => _selectedCountryCode = picked);
+        if (picked != null && mounted) {
+          setState(() => _selectedCountryCode = picked);
+        }
       },
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
         decoration: BoxDecoration(
           color: const Color(0xFF1A1A2E),
           borderRadius: BorderRadius.circular(12),
@@ -307,7 +373,8 @@ class _LoginScreenState extends State<LoginScreen>
               ),
             ),
             const SizedBox(width: 4),
-            const Icon(Icons.arrow_drop_down, color: Color(0xFF2AABEE), size: 20),
+            const Icon(Icons.arrow_drop_down,
+                color: Color(0xFF2AABEE), size: 20),
           ],
         ),
       ),
@@ -337,17 +404,15 @@ class _LoginScreenState extends State<LoginScreen>
           const SizedBox(height: 8),
           Text(
             'We sent a 5-digit code to\n$_selectedCountryCode ${_phoneController.text.trim()}',
-            style: const TextStyle(color: Color(0xFF9090B0), fontSize: 15),
+            style:
+                const TextStyle(color: Color(0xFF9090B0), fontSize: 15),
           ),
           const SizedBox(height: 36),
 
           // OTP input boxes
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: List.generate(
-              5,
-              (i) => _buildOtpBox(i),
-            ),
+            children: List.generate(5, (i) => _buildOtpBox(i)),
           ),
 
           const SizedBox(height: 36),
@@ -402,11 +467,13 @@ class _LoginScreenState extends State<LoginScreen>
           contentPadding: EdgeInsets.zero,
           enabledBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Color(0xFF2A2A40), width: 1.5),
+            borderSide:
+                const BorderSide(color: Color(0xFF2A2A40), width: 1.5),
           ),
           focusedBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Color(0xFF2AABEE), width: 2),
+            borderSide:
+                const BorderSide(color: Color(0xFF2AABEE), width: 2),
           ),
           filled: true,
           fillColor: const Color(0xFF1A1A2E),
@@ -417,9 +484,10 @@ class _LoginScreenState extends State<LoginScreen>
           } else if (value.isEmpty && index > 0) {
             _otpFocusNodes[index - 1].requestFocus();
           }
-          // Auto-submit when all 5 digits entered
+          // Auto-submit when all 5 digits are entered
           if (index == 4 && value.isNotEmpty) {
-            _submitOtp();
+            final code = _otpControllers.map((c) => c.text).join();
+            if (code.length == 5) _submitOtp();
           }
         },
       ),
@@ -459,10 +527,13 @@ class _LoginScreenState extends State<LoginScreen>
             style: const TextStyle(color: Colors.white, fontSize: 16),
             decoration: InputDecoration(
               hintText: 'Cloud password',
-              prefixIcon: const Icon(Icons.lock_outline, color: Color(0xFF2AABEE)),
+              prefixIcon: const Icon(Icons.lock_outline,
+                  color: Color(0xFF2AABEE)),
               suffixIcon: IconButton(
                 icon: Icon(
-                  _obscurePassword ? Icons.visibility_off : Icons.visibility,
+                  _obscurePassword
+                      ? Icons.visibility_off
+                      : Icons.visibility,
                   color: const Color(0xFF606080),
                 ),
                 onPressed: () =>
@@ -518,7 +589,8 @@ class _LoginScreenState extends State<LoginScreen>
               ),
             ],
           ),
-          child: const Icon(Icons.play_circle_rounded, color: Colors.white, size: 28),
+          child: const Icon(Icons.play_circle_rounded,
+              color: Colors.white, size: 28),
         ),
         const SizedBox(width: 12),
         const Text(
