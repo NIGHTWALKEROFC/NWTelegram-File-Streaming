@@ -7,8 +7,6 @@ workflows:
 
     environment:
       flutter: stable
-      # FIX: Gradle 8.13 + AGP 8.9 require Java 17 explicitly.
-      # Without this, Codemagic may pick Java 11 and the build fails.
       java: 17
       groups:
         - telegram_keys
@@ -31,11 +29,27 @@ workflows:
         script: |
           flutter analyze --no-fatal-infos || true
 
+      # FIX: Removed --split-per-abi from both builds.
+      #
+      # --split-per-abi produces THREE separate APK files:
+      #   app-arm64-v8a-release.apk    ← correct for Samsung A05s
+      #   app-armeabi-v7a-release.apk  ← 32-bit, CRASHES on 64-bit devices
+      #   app-x86_64-release.apk       ← emulator only
+      #
+      # If you install the wrong one (armeabi-v7a on a 64-bit phone) the
+      # app opens the splash screen and immediately crashes because
+      # libtdjni.so built for arm64 is not found.
+      #
+      # Building WITHOUT --split-per-abi produces ONE universal APK that
+      # includes all supported ABIs and always installs correctly.
+      #
+      # The AAB (App Bundle) for Play Store handles ABI splitting
+      # automatically on the server side — safe to keep for AAB.
+
       - name: Build Android APK (release)
         script: |
           flutter build apk \
             --release \
-            --split-per-abi \
             --dart-define=TG_API_ID=${TG_API_ID} \
             --dart-define=TG_API_HASH=${TG_API_HASH} \
             --build-name="1.0.0" \
