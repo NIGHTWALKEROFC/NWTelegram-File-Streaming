@@ -1,6 +1,6 @@
 // lib/screens/player_screen.dart
 
-import 'dart:async'; // FIX: Missing import — StreamSubscription lives here
+import 'dart:async'; // required for StreamSubscription
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -38,11 +38,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
 
-  final List<StreamSubscription<dynamic>> _audioSubs = [];
+  // Store subscriptions to cancel them on dispose — prevents
+  // "setState() called after dispose()" crashes.
+  final List<StreamSubscription<dynamic>> _subs = [];
 
   @override
   void initState() {
     super.initState();
+    // Small delay so the local proxy has time to bind before the player
+    // makes its first HTTP request.
     Future.delayed(const Duration(milliseconds: 400), _initPlayer);
   }
 
@@ -80,23 +84,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     _videoController = VideoPlayerController.networkUrl(
       uri,
-      httpHeaders: {
-        'Accept': '*/*',
-        'Connection': 'keep-alive',
-      },
+      httpHeaders: const {'Accept': '*/*', 'Connection': 'keep-alive'},
     );
 
-    _videoController!.addListener(_onVideoPlayerUpdate);
+    _videoController!.addListener(_onVideoError);
     await _videoController!.initialize();
-
     if (!mounted) return;
 
     final qualityLabel = widget.selectedQuality?.label ??
         (widget.file.height > 0 ? '${widget.file.height}p' : '');
 
-    Widget? overlayWidget;
+    // IMPORTANT: Chewie's `overlay` must NOT be a Positioned widget.
+    // Positioned only works directly inside a Stack. Passing it as
+    // ChewieController.overlay crashes with:
+    //   "Positioned widgets must be placed directly inside a Stack."
+    // Use Align instead — it works anywhere.
+    Widget? overlay;
     if (qualityLabel.isNotEmpty) {
-      overlayWidget = Align(
+      overlay = Align(
         alignment: Alignment.topRight,
         child: Padding(
           padding: const EdgeInsets.only(top: 12, right: 12),
@@ -139,11 +144,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         backgroundColor: const Color(0xFF3A3A5A),
         bufferedColor: const Color(0xFF2AABEE).withOpacity(0.3),
       ),
-      overlay: overlayWidget,
+      overlay: overlay,
     );
   }
 
-  void _onVideoPlayerUpdate() {
+  void _onVideoError() {
     final value = _videoController?.value;
     if (value == null) return;
     if (value.hasError && _initError == null && mounted) {
@@ -154,34 +159,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _initAudioPlayer() async {
     _audioPlayer = AudioPlayer();
 
-    _audioSubs.add(
-      _audioPlayer!.durationStream.listen((d) {
-        if (d != null && mounted) setState(() => _audioDuration = d);
-      }),
-    );
-    _audioSubs.add(
-      _audioPlayer!.positionStream.listen((p) {
-        if (mounted) setState(() => _audioPosition = p);
-      }),
-    );
-    _audioSubs.add(
-      _audioPlayer!.playingStream.listen((playing) {
-        if (mounted) setState(() => _isAudioPlaying = playing);
-      }),
-    );
+    _subs.add(_audioPlayer!.durationStream.listen((d) {
+      if (d != null && mounted) setState(() => _audioDuration = d);
+    }));
+    _subs.add(_audioPlayer!.positionStream.listen((p) {
+      if (mounted) setState(() => _audioPosition = p);
+    }));
+    _subs.add(_audioPlayer!.playingStream.listen((playing) {
+      if (mounted) setState(() => _isAudioPlaying = playing);
+    }));
 
     await _audioPlayer!.setUrl(widget.streamUrl);
     await _audioPlayer!.play();
   }
 
   void _disposeControllers() {
-    for (final sub in _audioSubs) {
-      sub.cancel();
+    // Cancel subscriptions FIRST to stop callbacks on disposed objects.
+    for (final s in _subs) {
+      s.cancel();
     }
-    _audioSubs.clear();
+    _subs.clear();
 
-    _videoController?.removeListener(_onVideoPlayerUpdate);
+    _videoController?.removeListener(_onVideoError);
 
+    // Dispose ChewieController BEFORE VideoPlayerController.
+    // Reverse order causes "VideoPlayerController was disposed" inside Chewie.
     _chewieController?.dispose();
     _chewieController = null;
     _videoController?.dispose();
@@ -193,6 +195,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    // Restore portrait in case the user exits from fullscreen landscape.
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
@@ -201,6 +204,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.dispose();
   }
 
+  // ──────────────────────────────────────────
+  // Build
+  // ──────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -231,7 +237,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            CircularProgressIndicator(color: Color(0xFF2AABEE), strokeWidth: 2),
+            CircularProgressIndicator(
+                color: Color(0xFF2AABEE), strokeWidth: 2),
             SizedBox(height: 20),
             Text(
               'Connecting to stream...',
@@ -241,33 +248,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
     }
-
     if (_initError != null) return _buildErrorView();
-    if (widget.file.isVideo) return _buildVideoPlayer();
-    if (widget.file.isAudio) return _buildAudioPlayer();
+    if (widget.file.isVideo) return _buildVideoView();
+    if (widget.file.isAudio) return _buildAudioView();
     return _buildDocumentView();
   }
 
-  Widget _buildVideoPlayer() {
-    final controller = _chewieController;
-    final videoValue = _videoController?.value;
-
-    if (controller == null ||
-        videoValue == null ||
-        !videoValue.isInitialized ||
-        videoValue.aspectRatio <= 0) {
+  Widget _buildVideoView() {
+    final ctrl = _chewieController;
+    final val = _videoController?.value;
+    if (ctrl == null || val == null || !val.isInitialized || val.aspectRatio <= 0) {
       return const Center(
         child: CircularProgressIndicator(
             color: Color(0xFF2AABEE), strokeWidth: 2),
       );
     }
-
     return Stack(
       children: [
         Center(
           child: AspectRatio(
-            aspectRatio: videoValue.aspectRatio,
-            child: Chewie(controller: controller),
+            aspectRatio: val.aspectRatio,
+            child: Chewie(controller: ctrl),
           ),
         ),
         Positioned(
@@ -292,7 +293,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  Widget _buildAudioPlayer() {
+  Widget _buildAudioView() {
     final progress = _audioDuration.inMilliseconds > 0
         ? (_audioPosition.inMilliseconds / _audioDuration.inMilliseconds)
             .clamp(0.0, 1.0)
@@ -348,15 +349,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
               inactiveTrackColor: const Color(0xFF3A3A5A),
               thumbColor: const Color(0xFF9B59B6),
               trackHeight: 4,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+              thumbShape:
+                  const RoundSliderThumbShape(enabledThumbRadius: 8),
             ),
             child: Slider(
-              value: progress.toDouble(),
+              value: progress,
               onChanged: (v) {
                 final pos = Duration(
-                  milliseconds:
-                      (v * _audioDuration.inMilliseconds).round(),
-                );
+                    milliseconds:
+                        (v * _audioDuration.inMilliseconds).round());
                 _audioPlayer?.seek(pos);
               },
             ),
@@ -366,10 +367,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(_formatDuration(_audioPosition),
+                Text(_fmt(_audioPosition),
                     style: const TextStyle(
                         color: Color(0xFF9090B0), fontSize: 12)),
-                Text(_formatDuration(_audioDuration),
+                Text(_fmt(_audioDuration),
                     style: const TextStyle(
                         color: Color(0xFF9090B0), fontSize: 12)),
               ],
@@ -381,12 +382,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
             children: [
               IconButton(
                 iconSize: 32,
-                icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
+                icon:
+                    const Icon(Icons.replay_10_rounded, color: Colors.white),
                 onPressed: () {
-                  final pos =
+                  final p =
                       _audioPosition - const Duration(seconds: 10);
                   _audioPlayer?.seek(
-                      pos < Duration.zero ? Duration.zero : pos);
+                      p < Duration.zero ? Duration.zero : p);
                 },
               ),
               const SizedBox(width: 16),
@@ -420,12 +422,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
               const SizedBox(width: 16),
               IconButton(
                 iconSize: 32,
-                icon: const Icon(Icons.forward_30_rounded, color: Colors.white),
+                icon: const Icon(Icons.forward_30_rounded,
+                    color: Colors.white),
                 onPressed: () {
-                  final pos =
+                  final p =
                       _audioPosition + const Duration(seconds: 30);
                   _audioPlayer?.seek(
-                      pos > _audioDuration ? _audioDuration : pos);
+                      p > _audioDuration ? _audioDuration : p);
                 },
               ),
             ],
@@ -467,7 +470,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     color: Color(0xFF9090B0), fontSize: 14)),
             const SizedBox(height: 32),
             const Text(
-              'Document streaming is not supported in the player.\nThe file can be opened in a browser via the stream URL.',
+              'Document streaming is not supported in the player.\n'
+              'The file can be opened in a browser via the stream URL.',
               style: TextStyle(
                   color: Color(0xFF7070A0), fontSize: 14, height: 1.5),
               textAlign: TextAlign.center,
@@ -500,7 +504,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     fontWeight: FontWeight.w600)),
             const SizedBox(height: 10),
             Text(
-              _initError ?? 'Unknown error occurred',
+              _initError ?? 'Unknown error',
               style: const TextStyle(
                   color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
               textAlign: TextAlign.center,
@@ -530,12 +534,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  String _formatDuration(Duration d) {
+  String _fmt(Duration d) {
     final h = d.inHours;
     final m = d.inMinutes % 60;
     final s = d.inSeconds % 60;
     if (h > 0) {
-      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+      return '${h.toString().padLeft(2, '0')}:'
+          '${m.toString().padLeft(2, '0')}:'
+          '${s.toString().padLeft(2, '0')}';
     }
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
