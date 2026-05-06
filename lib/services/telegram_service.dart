@@ -1,20 +1,16 @@
 // lib/services/telegram_service.dart
 //
-// ROOT CAUSE OF SPLASH CRASH:
-// TdPlugin.initialize() loads libtdjni.so synchronously on whichever
-// thread calls it. In a release APK, calling this on the Flutter main
-// isolate (UI thread) blocks the Android main looper long enough that
-// the OS kills the process — this shows up as a splash screen freeze
-// followed by a silent crash with no Dart exception.
-//
-// FIX: All TDLib work runs on a background Isolate.
-// The handshake is:
-//   1. UI spawns isolate, giving it the UI's ReceivePort sendPort.
-//   2. Isolate sends back its OWN SendPort as the very first message.
-//   3. UI waits for that SendPort via a Completer before sending anything.
-//   4. UI sends _InitData; isolate loads TDLib and starts polling.
-//   5. All TDLib updates flow to UI as _TdUpdate messages.
-//   6. Requests are matched to responses via '@extra' string IDs.
+// FIXES IN THIS VERSION:
+// 1. sendPhoneNumber() now waits for the authorizationStateWaitCode update
+//    before returning true. Previously it returned true on "ok" but the page
+//    navigation relied on a separate listener that could race/miss the event.
+// 2. sendOtpCode() now waits for authorizationStateReady or
+//    authorizationStateWaitPassword before returning.
+// 3. sendPassword() waits for authorizationStateReady.
+// 4. Added _awaitAuthState() helper — listens to the update stream for a
+//    specific auth state transition, with a 30s timeout.
+// 5. checkDatabaseEncryptionKey is now also handled for newer TDLib builds
+//    that may emit it before waitPhoneNumber.
 
 import 'dart:async';
 import 'dart:convert';
@@ -68,14 +64,10 @@ class _TdUpdate {
 
 // ── Background isolate ────────────────────────────────────────────────────────
 
-// Top-level: required by Isolate.spawn
 void _isolateMain(SendPort uiSendPort) {
   final rp = ReceivePort();
-
-  // Step 2: tell the UI how to reach us
   uiSendPort.send(rp.sendPort);
 
-  // Step 3: wait for _InitData then start TDLib
   late StreamSubscription sub;
   sub = rp.listen((msg) {
     if (msg is _InitData) {
@@ -86,12 +78,10 @@ void _isolateMain(SendPort uiSendPort) {
 }
 
 void _runTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
-  // Safe: we are on a background isolate, not the Android main thread
   TdPlugin.initialize();
 
   final clientId = TdPlugin.instance.tdCreateClientId();
 
-  // Send TDLib parameters immediately
   TdPlugin.instance.tdSend(
     clientId,
     jsonEncode({
@@ -113,14 +103,12 @@ void _runTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
     }),
   );
 
-  // Forward requests from UI → TDLib
   rp.listen((msg) {
     if (msg is _SendRequest) {
       TdPlugin.instance.tdSend(clientId, msg.json);
     }
   });
 
-  // Poll TDLib and forward updates → UI
   Timer.periodic(const Duration(milliseconds: 50), (_) {
     final raw = TdPlugin.instance.tdReceive(0.0);
     if (raw != null && raw.isNotEmpty) {
@@ -168,15 +156,12 @@ class TelegramService extends ChangeNotifier {
       await io.Directory(dbPath).create(recursive: true);
       await io.Directory(filesPath).create(recursive: true);
 
-      // Create UI port BEFORE spawning so no messages are dropped
       _uiPort = ReceivePort();
 
-      // Completer waits for the background SendPort (step 2 of handshake)
       final bgPortCompleter = Completer<SendPort>();
 
       _uiPort!.listen((msg) {
         if (msg is SendPort) {
-          // First message from background — its SendPort
           if (!bgPortCompleter.isCompleted) bgPortCompleter.complete(msg);
           return;
         }
@@ -191,14 +176,12 @@ class TelegramService extends ChangeNotifier {
         debugName: 'tdlib_bg',
       );
 
-      // Wait for background to send its SendPort (step 2)
       _bgPort = await bgPortCompleter.future.timeout(
         const Duration(seconds: 5),
         onTimeout: () =>
             throw TimeoutException('TDLib isolate did not start in time'),
       );
 
-      // Step 3: send init data to background
       _bgPort!.send(_InitData(
         dbPath: dbPath,
         filesPath: filesPath,
@@ -208,7 +191,6 @@ class TelegramService extends ChangeNotifier {
 
       _isInitialized = true;
 
-      // Wait up to 10 s for first auth state
       await _awaitFirstAuthState();
     } catch (e, st) {
       debugPrint('TelegramService.initialize failed: $e\n$st');
@@ -242,6 +224,61 @@ class TelegramService extends ChangeNotifier {
       Future.delayed(const Duration(seconds: 10)),
     ]);
     sub.cancel();
+  }
+
+  /// Waits until the auth state becomes one of [targetStates] or an error occurs.
+  /// Returns the auth state that was reached, or AuthState.error on timeout.
+  Future<AuthState> _awaitAuthState(
+    List<AuthState> targetStates, {
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    // If we are already in a target state, return immediately.
+    if (targetStates.contains(_authState)) return _authState;
+
+    final completer = Completer<AuthState>();
+    late StreamSubscription<Map<String, dynamic>> sub;
+
+    sub = _updates.stream.listen((u) {
+      if (u['@type'] != 'updateAuthorizationState') return;
+      if (completer.isCompleted) return;
+
+      final stateType =
+          (u['authorization_state'] as Map<String, dynamic>?)?['@type']
+              as String?;
+
+      AuthState? reached;
+      switch (stateType) {
+        case 'authorizationStateWaitPhoneNumber':
+          reached = AuthState.waitingPhone;
+          break;
+        case 'authorizationStateWaitCode':
+          reached = AuthState.waitingCode;
+          break;
+        case 'authorizationStateWaitPassword':
+          reached = AuthState.waitingPassword;
+          break;
+        case 'authorizationStateReady':
+          reached = AuthState.authorized;
+          break;
+        default:
+          break;
+      }
+
+      if (reached != null && targetStates.contains(reached)) {
+        completer.complete(reached);
+        sub.cancel();
+      }
+    });
+
+    final result = await completer.future.timeout(
+      timeout,
+      onTimeout: () {
+        sub.cancel();
+        debugPrint('_awaitAuthState timeout waiting for $targetStates');
+        return AuthState.error;
+      },
+    );
+    return result;
   }
 
   void _handleUpdate(Map<String, dynamic> u) {
@@ -288,8 +325,12 @@ class TelegramService extends ChangeNotifier {
 
   // ── Auth actions ────────────────────────────────────────────────────────────
 
+  /// Sends the phone number and waits until TDLib transitions to
+  /// waitingCode (success) or emits an error.
   Future<bool> sendPhoneNumber(String phone) async {
     _errorMessage = '';
+
+    // Send the request — TDLib will reply with "ok" or "error"
     final res = await _request({
       '@type': 'setAuthenticationPhoneNumber',
       'phone_number': phone,
@@ -301,35 +342,90 @@ class TelegramService extends ChangeNotifier {
         'allow_sms_retriever_api': false,
       },
     });
+
+    // Explicit error from TDLib (wrong number format, flood wait, etc.)
     if (res != null && res['@type'] == 'error') {
-      _errorMessage = res['message'] as String? ?? 'Error';
+      _errorMessage = res['message'] as String? ?? 'Error sending code';
       notifyListeners();
       return false;
     }
+
+    // "ok" received — now wait for the auth state to advance to waitingCode.
+    // This is the critical fix: without this wait, the UI returns before the
+    // auth state update arrives and the OTP page never appears.
+    final reached = await _awaitAuthState(
+      [AuthState.waitingCode, AuthState.waitingPassword, AuthState.authorized],
+    );
+
+    if (reached == AuthState.error) {
+      // Timed out — check if we already advanced via notifyListeners
+      if (_authState == AuthState.waitingCode ||
+          _authState == AuthState.waitingPassword ||
+          _authState == AuthState.authorized) {
+        return true;
+      }
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out waiting for code';
+      notifyListeners();
+      return false;
+    }
+
     return true;
   }
 
+  /// Submits the OTP and waits for ready or 2FA prompt.
   Future<bool> sendOtpCode(String code) async {
     _errorMessage = '';
     final res = await _request(
         {'@type': 'checkAuthenticationCode', 'code': code});
+
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Invalid code';
       notifyListeners();
       return false;
     }
+
+    // Wait for TDLib to confirm the new state
+    final reached = await _awaitAuthState(
+      [AuthState.authorized, AuthState.waitingPassword],
+    );
+
+    if (reached == AuthState.error) {
+      if (_authState == AuthState.authorized ||
+          _authState == AuthState.waitingPassword) {
+        return true;
+      }
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out verifying code';
+      notifyListeners();
+      return false;
+    }
+
     return true;
   }
 
+  /// Submits the 2FA password and waits for authorized state.
   Future<bool> sendPassword(String password) async {
     _errorMessage = '';
     final res = await _request(
         {'@type': 'checkAuthenticationPassword', 'password': password});
+
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Wrong password';
       notifyListeners();
       return false;
     }
+
+    final reached = await _awaitAuthState([AuthState.authorized]);
+
+    if (reached == AuthState.error) {
+      if (_authState == AuthState.authorized) return true;
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out verifying password';
+      notifyListeners();
+      return false;
+    }
+
     return true;
   }
 
@@ -394,7 +490,6 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // prefer real size, fall back to expected_size
   int _sz(Map<String, dynamic> f) {
     final s = f['size'] as int? ?? 0;
     return s > 0 ? s : (f['expected_size'] as int? ?? 0);
