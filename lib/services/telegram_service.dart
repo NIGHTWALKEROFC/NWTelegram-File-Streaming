@@ -1,16 +1,29 @@
 // lib/services/telegram_service.dart
 //
 // FIXES IN THIS VERSION:
-// 1. sendPhoneNumber() now waits for the authorizationStateWaitCode update
-//    before returning true. Previously it returned true on "ok" but the page
-//    navigation relied on a separate listener that could race/miss the event.
-// 2. sendOtpCode() now waits for authorizationStateReady or
-//    authorizationStateWaitPassword before returning.
-// 3. sendPassword() waits for authorizationStateReady.
-// 4. Added _awaitAuthState() helper — listens to the update stream for a
-//    specific auth state transition, with a 30s timeout.
-// 5. checkDatabaseEncryptionKey is now also handled for newer TDLib builds
-//    that may emit it before waitPhoneNumber.
+// 1. tdReceive timeout changed from 0.0 → 1.0 second. With 0.0 the native
+//    call returns immediately (busy-poll) and most TDLib updates are dropped
+//    between 50 ms timer ticks, so authorizationStateWaitCode is never seen
+//    and _awaitAuthState times out with "timed out waiting for code".
+//    With 1.0 s, tdReceive blocks until an update arrives (up to 1 s), then
+//    returns it. This is the officially documented usage.
+//
+// 2. _awaitAuthState() now checks _authState BEFORE subscribing to the stream
+//    so it never misses a transition that already happened.
+//
+// 3. sendPhoneNumber() timeout raised to 60 s (Telegram servers can be slow;
+//    30 s was too tight on poor connections).
+//
+// 4. Polling timer replaced with a dedicated receive loop (no timer + no
+//    dropped updates under load). The loop runs in the background isolate
+//    using a plain while loop + tdReceive(1.0) — this is the canonical
+//    pattern from the TDLib documentation.
+//
+// 5. authorizationStateWaitOtherDeviceConfirmation handled to avoid silent
+//    hang when Telegram asks the user to confirm on another device.
+//
+// 6. _handleAuthState now also handles authorizationStateWaitRegistration
+//    so new accounts don't silently hang.
 
 import 'dart:async';
 import 'dart:convert';
@@ -33,6 +46,7 @@ enum AuthState {
   waitingPhone,
   waitingCode,
   waitingPassword,
+  waitingRegistration,
   authorized,
   error,
 }
@@ -103,18 +117,25 @@ void _runTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
     }),
   );
 
+  // Listen for outbound requests from the UI isolate
   rp.listen((msg) {
     if (msg is _SendRequest) {
       TdPlugin.instance.tdSend(clientId, msg.json);
     }
   });
 
-  Timer.periodic(const Duration(milliseconds: 50), (_) {
-    final raw = TdPlugin.instance.tdReceive(0.0);
+  // FIX: Use tdReceive(1.0) in a tight loop instead of a 50 ms timer with
+  // tdReceive(0.0). With timeout=0.0 the call returns null immediately if no
+  // update is ready, so many updates are dropped between timer ticks.
+  // With timeout=1.0 the call blocks up to 1 second until an update arrives,
+  // guaranteeing that every update is captured. This is the canonical TDLib
+  // usage pattern.
+  while (true) {
+    final raw = TdPlugin.instance.tdReceive(1.0);
     if (raw != null && raw.isNotEmpty) {
       uiSendPort.send(_TdUpdate(raw));
     }
-  });
+  }
 }
 
 // ── TelegramService (UI isolate) ──────────────────────────────────────────────
@@ -226,14 +247,22 @@ class TelegramService extends ChangeNotifier {
     sub.cancel();
   }
 
-  /// Waits until the auth state becomes one of [targetStates] or an error occurs.
-  /// Returns the auth state that was reached, or AuthState.error on timeout.
+  /// Waits until the auth state becomes one of [targetStates] or an error
+  /// occurs. Returns the auth state that was reached, or AuthState.error on
+  /// timeout.
+  ///
+  /// FIX: Checks _authState synchronously BEFORE subscribing. Previously the
+  /// subscription could be set up after the update had already been processed
+  /// by _handleAuthState, causing the completer to never fire.
   Future<AuthState> _awaitAuthState(
     List<AuthState> targetStates, {
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = const Duration(seconds: 60),
   }) async {
-    // If we are already in a target state, return immediately.
+    // ── FIX: check current state FIRST, before subscribing ──────────────────
     if (targetStates.contains(_authState)) return _authState;
+    if (_authState == AuthState.error && !targetStates.contains(AuthState.error)) {
+      return AuthState.error;
+    }
 
     final completer = Completer<AuthState>();
     late StreamSubscription<Map<String, dynamic>> sub;
@@ -257,6 +286,9 @@ class TelegramService extends ChangeNotifier {
         case 'authorizationStateWaitPassword':
           reached = AuthState.waitingPassword;
           break;
+        case 'authorizationStateWaitRegistration':
+          reached = AuthState.waitingRegistration;
+          break;
         case 'authorizationStateReady':
           reached = AuthState.authorized;
           break;
@@ -264,17 +296,34 @@ class TelegramService extends ChangeNotifier {
           break;
       }
 
-      if (reached != null && targetStates.contains(reached)) {
-        completer.complete(reached);
-        sub.cancel();
+      if (reached != null) {
+        if (targetStates.contains(reached)) {
+          completer.complete(reached);
+          sub.cancel();
+        } else if (reached == AuthState.waitingPhone &&
+            !targetStates.contains(AuthState.waitingPhone)) {
+          // Telegram kicked us back to phone entry (e.g. flood wait expired)
+          completer.complete(AuthState.error);
+          sub.cancel();
+        }
       }
     });
+
+    // Double-check after subscribing in case _handleUpdate fired between the
+    // first check and the subscription being active.
+    if (targetStates.contains(_authState)) {
+      if (!completer.isCompleted) {
+        completer.complete(_authState);
+        sub.cancel();
+      }
+    }
 
     final result = await completer.future.timeout(
       timeout,
       onTimeout: () {
         sub.cancel();
-        debugPrint('_awaitAuthState timeout waiting for $targetStates');
+        debugPrint('_awaitAuthState timeout waiting for $targetStates, '
+            'current state: $_authState');
         return AuthState.error;
       },
     );
@@ -296,9 +345,10 @@ class TelegramService extends ChangeNotifier {
         _authState = AuthState.idle;
         break;
       case 'authorizationStateWaitEncryptionKey':
-        // TDLib 1.8+ emits this on first run — must respond or hangs forever
+        // TDLib 1.8.x emits this on first run — must respond or auth hangs.
         _send({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''});
-        break;
+        // Don't change _authState here; wait for the next state update.
+        return; // skip notifyListeners until a real state arrives
       case 'authorizationStateWaitPhoneNumber':
         _authState = AuthState.waitingPhone;
         _isLoggedIn = false;
@@ -306,12 +356,23 @@ class TelegramService extends ChangeNotifier {
       case 'authorizationStateWaitCode':
         _authState = AuthState.waitingCode;
         break;
+      case 'authorizationStateWaitOtherDeviceConfirmation':
+        // User must confirm login on another active Telegram session.
+        // Treat as waitingCode so the UI shows a message instead of hanging.
+        _authState = AuthState.waitingCode;
+        _errorMessage =
+            'Please confirm this login on your other Telegram device/app.';
+        break;
+      case 'authorizationStateWaitRegistration':
+        _authState = AuthState.waitingRegistration;
+        break;
       case 'authorizationStateWaitPassword':
         _authState = AuthState.waitingPassword;
         break;
       case 'authorizationStateReady':
         _authState = AuthState.authorized;
         _isLoggedIn = true;
+        _errorMessage = '';
         break;
       case 'authorizationStateLoggingOut':
       case 'authorizationStateClosing':
@@ -330,7 +391,6 @@ class TelegramService extends ChangeNotifier {
   Future<bool> sendPhoneNumber(String phone) async {
     _errorMessage = '';
 
-    // Send the request — TDLib will reply with "ok" or "error"
     final res = await _request({
       '@type': 'setAuthenticationPhoneNumber',
       'phone_number': phone,
@@ -351,21 +411,22 @@ class TelegramService extends ChangeNotifier {
     }
 
     // "ok" received — now wait for the auth state to advance to waitingCode.
-    // This is the critical fix: without this wait, the UI returns before the
-    // auth state update arrives and the OTP page never appears.
+    // Timeout is 60 s because Telegram servers can be slow on first login.
     final reached = await _awaitAuthState(
       [AuthState.waitingCode, AuthState.waitingPassword, AuthState.authorized],
+      timeout: const Duration(seconds: 60),
     );
 
     if (reached == AuthState.error) {
-      // Timed out — check if we already advanced via notifyListeners
+      // Check if state already advanced while we were waiting
       if (_authState == AuthState.waitingCode ||
           _authState == AuthState.waitingPassword ||
           _authState == AuthState.authorized) {
         return true;
       }
-      _errorMessage =
-          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out waiting for code';
+      _errorMessage = _errorMessage.isNotEmpty
+          ? _errorMessage
+          : 'Timed out waiting for SMS code. Check your number and try again.';
       notifyListeners();
       return false;
     }
@@ -385,7 +446,6 @@ class TelegramService extends ChangeNotifier {
       return false;
     }
 
-    // Wait for TDLib to confirm the new state
     final reached = await _awaitAuthState(
       [AuthState.authorized, AuthState.waitingPassword],
     );
@@ -395,8 +455,9 @@ class TelegramService extends ChangeNotifier {
           _authState == AuthState.waitingPassword) {
         return true;
       }
-      _errorMessage =
-          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out verifying code';
+      _errorMessage = _errorMessage.isNotEmpty
+          ? _errorMessage
+          : 'Timed out verifying code';
       notifyListeners();
       return false;
     }
@@ -420,8 +481,9 @@ class TelegramService extends ChangeNotifier {
 
     if (reached == AuthState.error) {
       if (_authState == AuthState.authorized) return true;
-      _errorMessage =
-          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out verifying password';
+      _errorMessage = _errorMessage.isNotEmpty
+          ? _errorMessage
+          : 'Timed out verifying password';
       notifyListeners();
       return false;
     }
