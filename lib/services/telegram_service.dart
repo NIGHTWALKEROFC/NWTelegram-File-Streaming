@@ -1,20 +1,20 @@
 // lib/services/telegram_service.dart
 //
-// WHY ISOLATE:
-// TdPlugin.initialize() loads libtdjni.so synchronously.
-// Calling it on the Flutter main isolate (UI thread) in a release
-// APK crashes immediately — the native lib blocks the Android
-// main looper. The handy_tdlib README explicitly says to run
-// TDLib "isolated from the main thread".
+// ROOT CAUSE OF SPLASH CRASH:
+// TdPlugin.initialize() loads libtdjni.so synchronously on whichever
+// thread calls it. In a release APK, calling this on the Flutter main
+// isolate (UI thread) blocks the Android main looper long enough that
+// the OS kills the process — this shows up as a splash screen freeze
+// followed by a silent crash with no Dart exception.
 //
-// HOW THIS WORKS:
-//  1. UI isolate spawns a background isolate, passing it a ReceivePort.
-//  2. Background isolate sends back its own SendPort (_tdSendPort) as
-//     the FIRST message so the UI can send requests to it.
-//  3. Background isolate then waits for ONE _InitData message that
-//     carries db paths and API credentials, then starts TDLib.
-//  4. Every TDLib update is forwarded to the UI via the UI ReceivePort.
-//  5. The UI matches responses to requests using the '@extra' id field.
+// FIX: All TDLib work runs on a background Isolate.
+// The handshake is:
+//   1. UI spawns isolate, giving it the UI's ReceivePort sendPort.
+//   2. Isolate sends back its OWN SendPort as the very first message.
+//   3. UI waits for that SendPort via a Completer before sending anything.
+//   4. UI sends _InitData; isolate loads TDLib and starts polling.
+//   5. All TDLib updates flow to UI as _TdUpdate messages.
+//   6. Requests are matched to responses via '@extra' string IDs.
 
 import 'dart:async';
 import 'dart:convert';
@@ -28,23 +28,26 @@ import 'package:handy_tdlib/handy_tdlib.dart';
 
 import '../models/telegram_file.dart';
 
-// ─── Compile-time constants injected via --dart-define ────────────────────────
 const int _kApiId = int.fromEnvironment('TG_API_ID', defaultValue: 0);
 const String _kApiHash =
     String.fromEnvironment('TG_API_HASH', defaultValue: '');
-// ─────────────────────────────────────────────────────────────────────────────
 
-enum AuthState { idle, waitingPhone, waitingCode, waitingPassword, authorized, error }
+enum AuthState {
+  idle,
+  waitingPhone,
+  waitingCode,
+  waitingPassword,
+  authorized,
+  error,
+}
 
-// ─── Data classes sent between isolates ──────────────────────────────────────
+// ── Messages sent between isolates ───────────────────────────────────────────
 
-/// Sent from UI → background after background sends its SendPort.
 class _InitData {
   final String dbPath;
   final String filesPath;
   final int apiId;
   final String apiHash;
-
   const _InitData({
     required this.dbPath,
     required this.filesPath,
@@ -53,45 +56,42 @@ class _InitData {
   });
 }
 
-/// Sent from UI → background: a JSON string to forward to TDLib.
 class _SendRequest {
   final String json;
   const _SendRequest(this.json);
 }
 
-/// Sent from background → UI: a JSON string received from TDLib.
 class _TdUpdate {
   final String json;
   const _TdUpdate(this.json);
 }
 
-// ─── Background isolate entry point ──────────────────────────────────────────
+// ── Background isolate ────────────────────────────────────────────────────────
 
-/// Top-level function (required for Isolate.spawn).
-/// [uiSendPort] is used to send updates back to the UI isolate.
-void _isolateEntry(SendPort uiSendPort) {
+// Top-level: required by Isolate.spawn
+void _isolateMain(SendPort uiSendPort) {
   final rp = ReceivePort();
 
-  // Step 1: Send our own SendPort to the UI so it can talk to us.
+  // Step 2: tell the UI how to reach us
   uiSendPort.send(rp.sendPort);
 
-  // Step 2: Wait for exactly ONE _InitData message, then start TDLib.
-  final sub = rp.listen(null);
-  sub.onData((message) {
-    if (message is _InitData) {
+  // Step 3: wait for _InitData then start TDLib
+  late StreamSubscription sub;
+  sub = rp.listen((msg) {
+    if (msg is _InitData) {
       sub.cancel();
-      _startTdLib(message, uiSendPort, rp);
+      _runTdLib(msg, uiSendPort, rp);
     }
   });
 }
 
-void _startTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
-  // Load the native libtdjni.so — safe here because we are off the main thread.
+void _runTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
+  // Safe: we are on a background isolate, not the Android main thread
   TdPlugin.initialize();
 
   final clientId = TdPlugin.instance.tdCreateClientId();
 
-  // Send initial TDLib parameters immediately.
+  // Send TDLib parameters immediately
   TdPlugin.instance.tdSend(
     clientId,
     jsonEncode({
@@ -113,14 +113,14 @@ void _startTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
     }),
   );
 
-  // Forward requests from UI → TDLib.
-  rp.listen((message) {
-    if (message is _SendRequest) {
-      TdPlugin.instance.tdSend(clientId, message.json);
+  // Forward requests from UI → TDLib
+  rp.listen((msg) {
+    if (msg is _SendRequest) {
+      TdPlugin.instance.tdSend(clientId, msg.json);
     }
   });
 
-  // Poll TDLib every 50ms and forward updates to UI.
+  // Poll TDLib and forward updates → UI
   Timer.periodic(const Duration(milliseconds: 50), (_) {
     final raw = TdPlugin.instance.tdReceive(0.0);
     if (raw != null && raw.isNotEmpty) {
@@ -129,15 +129,14 @@ void _startTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
   });
 }
 
-// ─── TelegramService ─────────────────────────────────────────────────────────
+// ── TelegramService (UI isolate) ──────────────────────────────────────────────
 
 class TelegramService extends ChangeNotifier {
   Isolate? _isolate;
-  ReceivePort? _uiReceivePort;
-  SendPort? _bgSendPort; // UI → background
+  ReceivePort? _uiPort;
+  SendPort? _bgPort;
 
-  final _updates =
-      StreamController<Map<String, dynamic>>.broadcast();
+  final _updates = StreamController<Map<String, dynamic>>.broadcast();
 
   AuthState _authState = AuthState.idle;
   String _errorMessage = '';
@@ -149,9 +148,6 @@ class TelegramService extends ChangeNotifier {
   bool get isLoggedIn => _isLoggedIn;
   bool get isInitialized => _isInitialized;
 
-  // ──────────────────────────────────────────
-  // Initialize
-  // ──────────────────────────────────────────
   Future<void> initialize() async {
     if (_isInitialized) return;
 
@@ -159,8 +155,7 @@ class TelegramService extends ChangeNotifier {
       _errorMessage =
           'Telegram API credentials are missing.\n'
           'Set TG_API_ID and TG_API_HASH in Codemagic → Environment Variables '
-          '(group: telegram_keys) and make sure codemagic.yaml passes them via '
-          '--dart-define=TG_API_ID=\${TG_API_ID} --dart-define=TG_API_HASH=\${TG_API_HASH}.';
+          '(group: telegram_keys).';
       _authState = AuthState.error;
       notifyListeners();
       return;
@@ -173,39 +168,38 @@ class TelegramService extends ChangeNotifier {
       await io.Directory(dbPath).create(recursive: true);
       await io.Directory(filesPath).create(recursive: true);
 
-      // Create the port BEFORE spawning so no messages are missed.
-      _uiReceivePort = ReceivePort();
+      // Create UI port BEFORE spawning so no messages are dropped
+      _uiPort = ReceivePort();
 
-      // Spawn the background isolate.
-      _isolate = await Isolate.spawn(
-        _isolateEntry,
-        _uiReceivePort!.sendPort,
-        debugName: 'tdlib_isolate',
-      );
+      // Completer waits for the background SendPort (step 2 of handshake)
+      final bgPortCompleter = Completer<SendPort>();
 
-      // The very first message from the background is its SendPort.
-      // We use a Completer to wait for it synchronously before proceeding.
-      final spCompleter = Completer<SendPort>();
-
-      _uiReceivePort!.listen((message) {
-        if (message is SendPort && !spCompleter.isCompleted) {
-          // First message: the background's SendPort.
-          spCompleter.complete(message);
+      _uiPort!.listen((msg) {
+        if (msg is SendPort) {
+          // First message from background — its SendPort
+          if (!bgPortCompleter.isCompleted) bgPortCompleter.complete(msg);
           return;
         }
-        if (message is _TdUpdate) {
-          _onUpdate(message.json);
+        if (msg is _TdUpdate) {
+          _onRawUpdate(msg.json);
         }
       });
 
-      // Wait for the background SendPort (should arrive in <100 ms).
-      _bgSendPort = await spCompleter.future
-          .timeout(const Duration(seconds: 5), onTimeout: () {
-        throw TimeoutException('Background isolate did not respond');
-      });
+      _isolate = await Isolate.spawn(
+        _isolateMain,
+        _uiPort!.sendPort,
+        debugName: 'tdlib_bg',
+      );
 
-      // Now send init data to the background.
-      _bgSendPort!.send(_InitData(
+      // Wait for background to send its SendPort (step 2)
+      _bgPort = await bgPortCompleter.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () =>
+            throw TimeoutException('TDLib isolate did not start in time'),
+      );
+
+      // Step 3: send init data to background
+      _bgPort!.send(_InitData(
         dbPath: dbPath,
         filesPath: filesPath,
         apiId: _kApiId,
@@ -214,8 +208,8 @@ class TelegramService extends ChangeNotifier {
 
       _isInitialized = true;
 
-      // Wait up to 10 s for TDLib to emit first auth state update.
-      await _waitForFirstAuthState();
+      // Wait up to 10 s for first auth state
+      await _awaitFirstAuthState();
     } catch (e, st) {
       debugPrint('TelegramService.initialize failed: $e\n$st');
       _errorMessage = e.toString();
@@ -224,17 +218,17 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  void _onUpdate(String raw) {
+  void _onRawUpdate(String raw) {
     try {
-      final update = jsonDecode(raw) as Map<String, dynamic>;
-      if (!_updates.isClosed) _updates.add(update);
-      _handleUpdate(update);
+      final u = jsonDecode(raw) as Map<String, dynamic>;
+      if (!_updates.isClosed) _updates.add(u);
+      _handleUpdate(u);
     } catch (e) {
-      debugPrint('TDLib parse error: $e');
+      debugPrint('TDLib parse error: $e  raw=$raw');
     }
   }
 
-  Future<void> _waitForFirstAuthState() async {
+  Future<void> _awaitFirstAuthState() async {
     final done = Completer<void>();
     late StreamSubscription<Map<String, dynamic>> sub;
     sub = _updates.stream.listen((u) {
@@ -250,9 +244,9 @@ class TelegramService extends ChangeNotifier {
     sub.cancel();
   }
 
-  void _handleUpdate(Map<String, dynamic> update) {
-    if (update['@type'] == 'updateAuthorizationState') {
-      final state = update['authorization_state'] as Map<String, dynamic>?;
+  void _handleUpdate(Map<String, dynamic> u) {
+    if (u['@type'] == 'updateAuthorizationState') {
+      final state = u['authorization_state'] as Map<String, dynamic>?;
       if (state != null) _handleAuthState(state);
     }
   }
@@ -260,36 +254,28 @@ class TelegramService extends ChangeNotifier {
   void _handleAuthState(Map<String, dynamic> state) {
     final type = state['@type'] as String?;
     debugPrint('TDLib auth → $type');
-
     switch (type) {
       case 'authorizationStateWaitTdlibParameters':
         _authState = AuthState.idle;
         break;
-
-      // TDLib 1.8+ emits this before waitPhoneNumber on first run / DB upgrade.
-      // Must respond or TDLib hangs forever.
       case 'authorizationStateWaitEncryptionKey':
+        // TDLib 1.8+ emits this on first run — must respond or hangs forever
         _send({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''});
         break;
-
       case 'authorizationStateWaitPhoneNumber':
         _authState = AuthState.waitingPhone;
         _isLoggedIn = false;
         break;
-
       case 'authorizationStateWaitCode':
         _authState = AuthState.waitingCode;
         break;
-
       case 'authorizationStateWaitPassword':
         _authState = AuthState.waitingPassword;
         break;
-
       case 'authorizationStateReady':
         _authState = AuthState.authorized;
         _isLoggedIn = true;
         break;
-
       case 'authorizationStateLoggingOut':
       case 'authorizationStateClosing':
       case 'authorizationStateClosed':
@@ -300,14 +286,13 @@ class TelegramService extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ──────────────────────────────────────────
-  // Auth actions
-  // ──────────────────────────────────────────
-  Future<bool> sendPhoneNumber(String phoneNumber) async {
+  // ── Auth actions ────────────────────────────────────────────────────────────
+
+  Future<bool> sendPhoneNumber(String phone) async {
     _errorMessage = '';
     final res = await _request({
       '@type': 'setAuthenticationPhoneNumber',
-      'phone_number': phoneNumber,
+      'phone_number': phone,
       'settings': {
         '@type': 'phoneNumberAuthenticationSettings',
         'allow_flash_call': false,
@@ -317,7 +302,7 @@ class TelegramService extends ChangeNotifier {
       },
     });
     if (res != null && res['@type'] == 'error') {
-      _errorMessage = res['message'] as String? ?? 'Error sending code';
+      _errorMessage = res['message'] as String? ?? 'Error';
       notifyListeners();
       return false;
     }
@@ -326,10 +311,8 @@ class TelegramService extends ChangeNotifier {
 
   Future<bool> sendOtpCode(String code) async {
     _errorMessage = '';
-    final res = await _request({
-      '@type': 'checkAuthenticationCode',
-      'code': code,
-    });
+    final res = await _request(
+        {'@type': 'checkAuthenticationCode', 'code': code});
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Invalid code';
       notifyListeners();
@@ -340,10 +323,8 @@ class TelegramService extends ChangeNotifier {
 
   Future<bool> sendPassword(String password) async {
     _errorMessage = '';
-    final res = await _request({
-      '@type': 'checkAuthenticationPassword',
-      'password': password,
-    });
+    final res = await _request(
+        {'@type': 'checkAuthenticationPassword', 'password': password});
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Wrong password';
       notifyListeners();
@@ -361,13 +342,13 @@ class TelegramService extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ──────────────────────────────────────────
-  // Resolve Telegram link → TelegramFile
-  // ──────────────────────────────────────────
+  // ── Resolve Telegram link ───────────────────────────────────────────────────
+
   Future<TelegramFile?> resolveLink(String link) async {
     _errorMessage = '';
     try {
-      final res = await _request({'@type': 'getMessageLinkInfo', 'url': link});
+      final res =
+          await _request({'@type': 'getMessageLinkInfo', 'url': link});
       if (res == null) {
         _errorMessage = 'No response from Telegram';
         notifyListeners();
@@ -413,7 +394,7 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // Helper: prefer real size, fall back to expected_size.
+  // prefer real size, fall back to expected_size
   int _sz(Map<String, dynamic> f) {
     final s = f['size'] as int? ?? 0;
     return s > 0 ? s : (f['expected_size'] as int? ?? 0);
@@ -426,7 +407,6 @@ class TelegramService extends ChangeNotifier {
     if (file == null) return null;
     final w = video['width'] as int? ?? 0;
     final h = video['height'] as int? ?? 0;
-
     final qualities = <VideoQuality>[
       VideoQuality(
         label: _label(h),
@@ -452,7 +432,6 @@ class TelegramService extends ChangeNotifier {
       ));
     }
     qualities.sort((a, b) => b.height.compareTo(a.height));
-
     return TelegramFile(
       type: TelegramFileType.video,
       name: video['file_name'] as String? ?? 'video.mp4',
@@ -543,14 +522,12 @@ class TelegramService extends ChangeNotifier {
 
   String? _thumbPath(dynamic t) {
     if (t == null) return null;
-    final m = t as Map<String, dynamic>?;
-    final f = m?['file'] as Map<String, dynamic>?;
+    final f = (t as Map<String, dynamic>?)?['file'] as Map<String, dynamic>?;
     return (f?['local'] as Map<String, dynamic>?)?['path'] as String?;
   }
 
-  // ──────────────────────────────────────────
-  // Download a byte range (for streaming)
-  // ──────────────────────────────────────────
+  // ── Streaming ───────────────────────────────────────────────────────────────
+
   Future<Uint8List?> downloadFilePart({
     required int fileId,
     required int offset,
@@ -574,8 +551,6 @@ class TelegramService extends ChangeNotifier {
       final f = io.File(path);
       if (!await f.exists()) return null;
 
-      // Use downloaded_prefix_size to know how many contiguous bytes
-      // from the start of the file are actually on disk right now.
       final prefixSize = (local?['downloaded_prefix_size'] as int?) ?? 0;
       final available = (prefixSize - offset).clamp(0, count);
       if (available <= 0) return Uint8List(0);
@@ -588,14 +563,15 @@ class TelegramService extends ChangeNotifier {
         await raf.close();
       }
     } catch (e) {
-      debugPrint('downloadFilePart error: $e');
+      debugPrint('downloadFilePart: $e');
       return null;
     }
   }
 
   Future<int> getFileSize(int fileId) async {
     try {
-      final res = await _request({'@type': 'getFile', 'file_id': fileId});
+      final res =
+          await _request({'@type': 'getFile', 'file_id': fileId});
       if (res == null || res['@type'] == 'error') return 0;
       final s = res['size'] as int? ?? 0;
       return s > 0 ? s : (res['expected_size'] as int? ?? 0);
@@ -604,19 +580,14 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // ──────────────────────────────────────────
-  // Low-level send helpers
-  // ──────────────────────────────────────────
+  // ── Low-level send/receive ──────────────────────────────────────────────────
 
-  /// Fire-and-forget: send a JSON map to TDLib with no response expected.
   void _send(Map<String, dynamic> req) {
-    _bgSendPort?.send(_SendRequest(jsonEncode(req)));
+    _bgPort?.send(_SendRequest(jsonEncode(req)));
   }
 
-  /// Send a request and wait for the matching TDLib response via '@extra'.
   Future<Map<String, dynamic>?> _request(Map<String, dynamic> req) async {
-    if (_bgSendPort == null) return null;
-
+    if (_bgPort == null) return null;
     final extra = DateTime.now().microsecondsSinceEpoch.toString();
     req['@extra'] = extra;
 
@@ -629,13 +600,13 @@ class TelegramService extends ChangeNotifier {
       }
     });
 
-    _bgSendPort!.send(_SendRequest(jsonEncode(req)));
+    _bgPort!.send(_SendRequest(jsonEncode(req)));
 
     return completer.future.timeout(
       const Duration(seconds: 30),
       onTimeout: () {
         sub.cancel();
-        debugPrint('TDLib request timeout: ${req['@type']}');
+        debugPrint('TDLib timeout: ${req['@type']}');
         return null;
       },
     );
@@ -645,8 +616,8 @@ class TelegramService extends ChangeNotifier {
   void dispose() {
     _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;
-    _uiReceivePort?.close();
-    _uiReceivePort = null;
+    _uiPort?.close();
+    _uiPort = null;
     _updates.close();
     super.dispose();
   }
