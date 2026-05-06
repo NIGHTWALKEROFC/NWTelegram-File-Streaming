@@ -1,45 +1,50 @@
 // lib/services/telegram_service.dart
 //
-// FIXES IN THIS VERSION:
-// 1. tdReceive timeout changed from 0.0 → 1.0 second. With 0.0 the native
-//    call returns immediately (busy-poll) and most TDLib updates are dropped
-//    between 50 ms timer ticks, so authorizationStateWaitCode is never seen
-//    and _awaitAuthState times out with "timed out waiting for code".
-//    With 1.0 s, tdReceive blocks until an update arrives (up to 1 s), then
-//    returns it. This is the officially documented usage.
+// ROOT CAUSE OF "timed out waiting for SMS code":
+// ================================================
+// The previous version spawned a background Isolate and called
+// TdPlugin.initialize() + tdReceive() inside it.
 //
-// 2. _awaitAuthState() now checks _authState BEFORE subscribing to the stream
-//    so it never misses a transition that already happened.
+// handy_tdlib registers its native methods through Flutter's plugin registry,
+// which only exists on the MAIN isolate. Calling TdPlugin from a spawned
+// isolate means the plugin is NOT registered there — tdReceive() always
+// returns null, events never arrive, and every _awaitAuthState() call
+// times out.
 //
-// 3. sendPhoneNumber() timeout raised to 60 s (Telegram servers can be slow;
-//    30 s was too tight on poor connections).
+// This is why Termux (direct native TDLib, no Flutter plugin layer) works
+// instantly: it talks to libtdjni.so directly without Flutter's method channel.
 //
-// 4. Polling timer replaced with a dedicated receive loop (no timer + no
-//    dropped updates under load). The loop runs in the background isolate
-//    using a plain while loop + tdReceive(1.0) — this is the canonical
-//    pattern from the TDLib documentation.
-//
-// 5. authorizationStateWaitOtherDeviceConfirmation handled to avoid silent
-//    hang when Telegram asks the user to confirm on another device.
-//
-// 6. _handleAuthState now also handles authorizationStateWaitRegistration
-//    so new accounts don't silently hang.
+// FIX:
+// ====
+// 1. No background isolate. Everything runs on the MAIN isolate.
+// 2. tdReceive is called via Flutter's compute() which runs the NATIVE ffi
+//    call on a platform thread (so it can block for up to 1 s without
+//    freezing the UI). tdReceive is a pure dart:ffi call — it does NOT
+//    use Flutter's method channel — so compute() is safe for it.
+// 3. The receive loop is a self-rescheduling async function that feeds
+//    every TDLib event into a broadcast StreamController.
+// 4. _awaitAuthState checks _authState synchronously BEFORE subscribing
+//    to avoid race conditions where the state was already set.
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:handy_tdlib/handy_tdlib.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../models/telegram_file.dart';
 
 const int _kApiId = int.fromEnvironment('TG_API_ID', defaultValue: 0);
 const String _kApiHash =
     String.fromEnvironment('TG_API_HASH', defaultValue: '');
+
+// Top-level compute function — safe because tdReceive uses dart:ffi directly,
+// NOT Flutter's method channel. It can run in compute()'s platform thread.
+String? _tdReceiveCompute(double timeout) =>
+    TdPlugin.instance.tdReceive(timeout);
 
 enum AuthState {
   idle,
@@ -51,118 +56,32 @@ enum AuthState {
   error,
 }
 
-// ── Messages sent between isolates ───────────────────────────────────────────
-
-class _InitData {
-  final String dbPath;
-  final String filesPath;
-  final int apiId;
-  final String apiHash;
-  const _InitData({
-    required this.dbPath,
-    required this.filesPath,
-    required this.apiId,
-    required this.apiHash,
-  });
-}
-
-class _SendRequest {
-  final String json;
-  const _SendRequest(this.json);
-}
-
-class _TdUpdate {
-  final String json;
-  const _TdUpdate(this.json);
-}
-
-// ── Background isolate ────────────────────────────────────────────────────────
-
-void _isolateMain(SendPort uiSendPort) {
-  final rp = ReceivePort();
-  uiSendPort.send(rp.sendPort);
-
-  late StreamSubscription sub;
-  sub = rp.listen((msg) {
-    if (msg is _InitData) {
-      sub.cancel();
-      _runTdLib(msg, uiSendPort, rp);
-    }
-  });
-}
-
-void _runTdLib(_InitData init, SendPort uiSendPort, ReceivePort rp) {
-  TdPlugin.initialize();
-
-  final clientId = TdPlugin.instance.tdCreateClientId();
-
-  TdPlugin.instance.tdSend(
-    clientId,
-    jsonEncode({
-      '@type': 'setTdlibParameters',
-      'use_test_dc': false,
-      'database_directory': init.dbPath,
-      'files_directory': init.filesPath,
-      'use_file_database': true,
-      'use_chat_info_database': true,
-      'use_message_database': true,
-      'use_secret_chats': false,
-      'api_id': init.apiId,
-      'api_hash': init.apiHash,
-      'system_language_code': 'en',
-      'device_model': io.Platform.isAndroid ? 'Android' : 'iOS',
-      'system_version': 'Unknown',
-      'application_version': '1.0.0',
-      'enable_storage_optimizer': true,
-    }),
-  );
-
-  // Listen for outbound requests from the UI isolate
-  rp.listen((msg) {
-    if (msg is _SendRequest) {
-      TdPlugin.instance.tdSend(clientId, msg.json);
-    }
-  });
-
-  // FIX: Use tdReceive(1.0) in a tight loop instead of a 50 ms timer with
-  // tdReceive(0.0). With timeout=0.0 the call returns null immediately if no
-  // update is ready, so many updates are dropped between timer ticks.
-  // With timeout=1.0 the call blocks up to 1 second until an update arrives,
-  // guaranteeing that every update is captured. This is the canonical TDLib
-  // usage pattern.
-  while (true) {
-    final raw = TdPlugin.instance.tdReceive(1.0);
-    if (raw != null && raw.isNotEmpty) {
-      uiSendPort.send(_TdUpdate(raw));
-    }
-  }
-}
-
-// ── TelegramService (UI isolate) ──────────────────────────────────────────────
-
 class TelegramService extends ChangeNotifier {
-  Isolate? _isolate;
-  ReceivePort? _uiPort;
-  SendPort? _bgPort;
+  late int _clientId;
 
-  final _updates = StreamController<Map<String, dynamic>>.broadcast();
+  final _updateCtrl = StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get _updates => _updateCtrl.stream;
+
+  bool _isInitialized = false;
+  bool _loopRunning = false;
 
   AuthState _authState = AuthState.idle;
   String _errorMessage = '';
   bool _isLoggedIn = false;
-  bool _isInitialized = false;
 
   AuthState get authState => _authState;
   String get errorMessage => _errorMessage;
   bool get isLoggedIn => _isLoggedIn;
   bool get isInitialized => _isInitialized;
 
+  // ── Initialize ─────────────────────────────────────────────────────────────
+
   Future<void> initialize() async {
     if (_isInitialized) return;
 
     if (_kApiId == 0 || _kApiHash.isEmpty) {
       _errorMessage =
-          'Telegram API credentials are missing.\n'
+          'Telegram API credentials missing.\n'
           'Set TG_API_ID and TG_API_HASH in Codemagic → Environment Variables '
           '(group: telegram_keys).';
       _authState = AuthState.error;
@@ -171,164 +90,91 @@ class TelegramService extends ChangeNotifier {
     }
 
     try {
+      // Must be called on the MAIN isolate — registers the Flutter plugin
+      TdPlugin.initialize();
+
+      _clientId = TdPlugin.instance.tdCreateClientId();
+
+      // Start the receive loop BEFORE sending any request
+      _startReceiveLoop();
+
+      // Prepare storage directories
       final appDir = await getApplicationDocumentsDirectory();
       final dbPath = '${appDir.path}/tdlib_db';
       final filesPath = '${appDir.path}/tdlib_files';
       await io.Directory(dbPath).create(recursive: true);
       await io.Directory(filesPath).create(recursive: true);
 
-      _uiPort = ReceivePort();
-
-      final bgPortCompleter = Completer<SendPort>();
-
-      _uiPort!.listen((msg) {
-        if (msg is SendPort) {
-          if (!bgPortCompleter.isCompleted) bgPortCompleter.complete(msg);
-          return;
-        }
-        if (msg is _TdUpdate) {
-          _onRawUpdate(msg.json);
-        }
+      // Send TDLib parameters — this triggers the auth state machine
+      _send({
+        '@type': 'setTdlibParameters',
+        'use_test_dc': false,
+        'database_directory': dbPath,
+        'files_directory': filesPath,
+        'use_file_database': true,
+        'use_chat_info_database': true,
+        'use_message_database': true,
+        'use_secret_chats': false,
+        'api_id': _kApiId,
+        'api_hash': _kApiHash,
+        'system_language_code': 'en',
+        'device_model': io.Platform.isAndroid ? 'Android' : 'iOS',
+        'system_version': 'Unknown',
+        'application_version': '1.0.0',
+        'enable_storage_optimizer': true,
       });
-
-      _isolate = await Isolate.spawn(
-        _isolateMain,
-        _uiPort!.sendPort,
-        debugName: 'tdlib_bg',
-      );
-
-      _bgPort = await bgPortCompleter.future.timeout(
-        const Duration(seconds: 5),
-        onTimeout: () =>
-            throw TimeoutException('TDLib isolate did not start in time'),
-      );
-
-      _bgPort!.send(_InitData(
-        dbPath: dbPath,
-        filesPath: filesPath,
-        apiId: _kApiId,
-        apiHash: _kApiHash,
-      ));
 
       _isInitialized = true;
 
-      await _awaitFirstAuthState();
+      // Wait for the first auth state update (max 10 s)
+      await _updates
+          .where((u) => u['@type'] == 'updateAuthorizationState')
+          .first
+          .timeout(const Duration(seconds: 10), onTimeout: () => {});
     } catch (e, st) {
-      debugPrint('TelegramService.initialize failed: $e\n$st');
+      debugPrint('TelegramService.initialize error: $e\n$st');
       _errorMessage = e.toString();
       _authState = AuthState.error;
       notifyListeners();
     }
   }
 
+  // ── Receive loop ───────────────────────────────────────────────────────────
+
+  void _startReceiveLoop() {
+    if (_loopRunning) return;
+    _loopRunning = true;
+    _receiveLoop();
+  }
+
+  void _receiveLoop() {
+    if (_updateCtrl.isClosed) return;
+    Future.microtask(() async {
+      try {
+        // compute() runs the native ffi call on a platform thread.
+        // 1.0 second timeout: blocks until an event arrives or 1 s elapses.
+        final raw = await compute(_tdReceiveCompute, 1.0);
+        if (raw != null && raw.isNotEmpty) {
+          _onRawUpdate(raw);
+        }
+      } catch (e) {
+        debugPrint('tdReceive error: $e');
+      }
+      if (!_updateCtrl.isClosed) _receiveLoop();
+    });
+  }
+
   void _onRawUpdate(String raw) {
     try {
       final u = jsonDecode(raw) as Map<String, dynamic>;
-      if (!_updates.isClosed) _updates.add(u);
+      _updateCtrl.add(u);
       _handleUpdate(u);
     } catch (e) {
-      debugPrint('TDLib parse error: $e  raw=$raw');
+      debugPrint('TDLib JSON parse error: $e  raw=$raw');
     }
   }
 
-  Future<void> _awaitFirstAuthState() async {
-    final done = Completer<void>();
-    late StreamSubscription<Map<String, dynamic>> sub;
-    sub = _updates.stream.listen((u) {
-      if (u['@type'] == 'updateAuthorizationState' && !done.isCompleted) {
-        done.complete();
-        sub.cancel();
-      }
-    });
-    await Future.any([
-      done.future,
-      Future.delayed(const Duration(seconds: 10)),
-    ]);
-    sub.cancel();
-  }
-
-  /// Waits until the auth state becomes one of [targetStates] or an error
-  /// occurs. Returns the auth state that was reached, or AuthState.error on
-  /// timeout.
-  ///
-  /// FIX: Checks _authState synchronously BEFORE subscribing. Previously the
-  /// subscription could be set up after the update had already been processed
-  /// by _handleAuthState, causing the completer to never fire.
-  Future<AuthState> _awaitAuthState(
-    List<AuthState> targetStates, {
-    Duration timeout = const Duration(seconds: 60),
-  }) async {
-    // ── FIX: check current state FIRST, before subscribing ──────────────────
-    if (targetStates.contains(_authState)) return _authState;
-    if (_authState == AuthState.error && !targetStates.contains(AuthState.error)) {
-      return AuthState.error;
-    }
-
-    final completer = Completer<AuthState>();
-    late StreamSubscription<Map<String, dynamic>> sub;
-
-    sub = _updates.stream.listen((u) {
-      if (u['@type'] != 'updateAuthorizationState') return;
-      if (completer.isCompleted) return;
-
-      final stateType =
-          (u['authorization_state'] as Map<String, dynamic>?)?['@type']
-              as String?;
-
-      AuthState? reached;
-      switch (stateType) {
-        case 'authorizationStateWaitPhoneNumber':
-          reached = AuthState.waitingPhone;
-          break;
-        case 'authorizationStateWaitCode':
-          reached = AuthState.waitingCode;
-          break;
-        case 'authorizationStateWaitPassword':
-          reached = AuthState.waitingPassword;
-          break;
-        case 'authorizationStateWaitRegistration':
-          reached = AuthState.waitingRegistration;
-          break;
-        case 'authorizationStateReady':
-          reached = AuthState.authorized;
-          break;
-        default:
-          break;
-      }
-
-      if (reached != null) {
-        if (targetStates.contains(reached)) {
-          completer.complete(reached);
-          sub.cancel();
-        } else if (reached == AuthState.waitingPhone &&
-            !targetStates.contains(AuthState.waitingPhone)) {
-          // Telegram kicked us back to phone entry (e.g. flood wait expired)
-          completer.complete(AuthState.error);
-          sub.cancel();
-        }
-      }
-    });
-
-    // Double-check after subscribing in case _handleUpdate fired between the
-    // first check and the subscription being active.
-    if (targetStates.contains(_authState)) {
-      if (!completer.isCompleted) {
-        completer.complete(_authState);
-        sub.cancel();
-      }
-    }
-
-    final result = await completer.future.timeout(
-      timeout,
-      onTimeout: () {
-        sub.cancel();
-        debugPrint('_awaitAuthState timeout waiting for $targetStates, '
-            'current state: $_authState');
-        return AuthState.error;
-      },
-    );
-    return result;
-  }
+  // ── TDLib update handler ───────────────────────────────────────────────────
 
   void _handleUpdate(Map<String, dynamic> u) {
     if (u['@type'] == 'updateAuthorizationState') {
@@ -338,42 +184,48 @@ class TelegramService extends ChangeNotifier {
   }
 
   void _handleAuthState(Map<String, dynamic> state) {
-    final type = state['@type'] as String?;
+    final type = state['@type'] as String? ?? '';
     debugPrint('TDLib auth → $type');
+
     switch (type) {
       case 'authorizationStateWaitTdlibParameters':
         _authState = AuthState.idle;
         break;
+
       case 'authorizationStateWaitEncryptionKey':
-        // TDLib 1.8.x emits this on first run — must respond or auth hangs.
+        // MUST respond immediately or the entire auth chain hangs
         _send({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''});
-        // Don't change _authState here; wait for the next state update.
-        return; // skip notifyListeners until a real state arrives
+        return; // skip notifyListeners — not a real user-facing state
+
       case 'authorizationStateWaitPhoneNumber':
         _authState = AuthState.waitingPhone;
         _isLoggedIn = false;
         break;
+
       case 'authorizationStateWaitCode':
         _authState = AuthState.waitingCode;
         break;
+
       case 'authorizationStateWaitOtherDeviceConfirmation':
-        // User must confirm login on another active Telegram session.
-        // Treat as waitingCode so the UI shows a message instead of hanging.
         _authState = AuthState.waitingCode;
         _errorMessage =
-            'Please confirm this login on your other Telegram device/app.';
+            'Please confirm this login on your other Telegram app or device.';
         break;
+
       case 'authorizationStateWaitRegistration':
         _authState = AuthState.waitingRegistration;
         break;
+
       case 'authorizationStateWaitPassword':
         _authState = AuthState.waitingPassword;
         break;
+
       case 'authorizationStateReady':
         _authState = AuthState.authorized;
         _isLoggedIn = true;
         _errorMessage = '';
         break;
+
       case 'authorizationStateLoggingOut':
       case 'authorizationStateClosing':
       case 'authorizationStateClosed':
@@ -381,13 +233,77 @@ class TelegramService extends ChangeNotifier {
         _isLoggedIn = false;
         break;
     }
+
     notifyListeners();
   }
 
-  // ── Auth actions ────────────────────────────────────────────────────────────
+  // ── Await auth state transition ────────────────────────────────────────────
 
-  /// Sends the phone number and waits until TDLib transitions to
-  /// waitingCode (success) or emits an error.
+  Future<AuthState> _awaitAuthState(
+    List<AuthState> targets, {
+    Duration timeout = const Duration(seconds: 60),
+  }) async {
+    // Check synchronously first — avoids missing a state already set
+    if (targets.contains(_authState)) return _authState;
+    if (_authState == AuthState.error) return AuthState.error;
+
+    final completer = Completer<AuthState>();
+    late StreamSubscription<Map<String, dynamic>> sub;
+
+    sub = _updates.listen((u) {
+      if (completer.isCompleted) return;
+      if (u['@type'] != 'updateAuthorizationState') return;
+
+      final stateType =
+          (u['authorization_state'] as Map<String, dynamic>?)?['@type']
+              as String?;
+      final reached = _authStateFromType(stateType);
+      if (reached == null) return;
+
+      if (targets.contains(reached)) {
+        completer.complete(reached);
+        sub.cancel();
+      }
+    });
+
+    // Double-check after subscribing — handles the tiny race window
+    if (targets.contains(_authState) && !completer.isCompleted) {
+      completer.complete(_authState);
+      sub.cancel();
+    }
+
+    return completer.future.timeout(
+      timeout,
+      onTimeout: () {
+        sub.cancel();
+        debugPrint(
+            '_awaitAuthState timeout. targets=$targets current=$_authState');
+        if (targets.contains(_authState)) return _authState;
+        return AuthState.error;
+      },
+    );
+  }
+
+  AuthState? _authStateFromType(String? type) {
+    switch (type) {
+      case 'authorizationStateWaitPhoneNumber':
+        return AuthState.waitingPhone;
+      case 'authorizationStateWaitCode':
+      case 'authorizationStateWaitOtherDeviceConfirmation':
+        return AuthState.waitingCode;
+      case 'authorizationStateWaitRegistration':
+        return AuthState.waitingRegistration;
+      case 'authorizationStateWaitPassword':
+        return AuthState.waitingPassword;
+      case 'authorizationStateReady':
+        return AuthState.authorized;
+      default:
+        return null;
+    }
+  }
+
+  // ── Auth actions ───────────────────────────────────────────────────────────
+
   Future<bool> sendPhoneNumber(String phone) async {
     _errorMessage = '';
 
@@ -403,30 +319,25 @@ class TelegramService extends ChangeNotifier {
       },
     });
 
-    // Explicit error from TDLib (wrong number format, flood wait, etc.)
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Error sending code';
       notifyListeners();
       return false;
     }
 
-    // "ok" received — now wait for the auth state to advance to waitingCode.
-    // Timeout is 60 s because Telegram servers can be slow on first login.
     final reached = await _awaitAuthState(
       [AuthState.waitingCode, AuthState.waitingPassword, AuthState.authorized],
       timeout: const Duration(seconds: 60),
     );
 
     if (reached == AuthState.error) {
-      // Check if state already advanced while we were waiting
       if (_authState == AuthState.waitingCode ||
           _authState == AuthState.waitingPassword ||
-          _authState == AuthState.authorized) {
-        return true;
+          _authState == AuthState.authorized) return true;
+      if (_errorMessage.isEmpty) {
+        _errorMessage =
+            'Could not send verification code. Check your number and try again.';
       }
-      _errorMessage = _errorMessage.isNotEmpty
-          ? _errorMessage
-          : 'Timed out waiting for SMS code. Check your number and try again.';
       notifyListeners();
       return false;
     }
@@ -434,11 +345,12 @@ class TelegramService extends ChangeNotifier {
     return true;
   }
 
-  /// Submits the OTP and waits for ready or 2FA prompt.
   Future<bool> sendOtpCode(String code) async {
     _errorMessage = '';
+
     final res = await _request(
-        {'@type': 'checkAuthenticationCode', 'code': code});
+      {'@type': 'checkAuthenticationCode', 'code': code},
+    );
 
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Invalid code';
@@ -452,12 +364,9 @@ class TelegramService extends ChangeNotifier {
 
     if (reached == AuthState.error) {
       if (_authState == AuthState.authorized ||
-          _authState == AuthState.waitingPassword) {
-        return true;
-      }
-      _errorMessage = _errorMessage.isNotEmpty
-          ? _errorMessage
-          : 'Timed out verifying code';
+          _authState == AuthState.waitingPassword) return true;
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out. Try again.';
       notifyListeners();
       return false;
     }
@@ -465,11 +374,12 @@ class TelegramService extends ChangeNotifier {
     return true;
   }
 
-  /// Submits the 2FA password and waits for authorized state.
   Future<bool> sendPassword(String password) async {
     _errorMessage = '';
+
     final res = await _request(
-        {'@type': 'checkAuthenticationPassword', 'password': password});
+      {'@type': 'checkAuthenticationPassword', 'password': password},
+    );
 
     if (res != null && res['@type'] == 'error') {
       _errorMessage = res['message'] as String? ?? 'Wrong password';
@@ -481,9 +391,8 @@ class TelegramService extends ChangeNotifier {
 
     if (reached == AuthState.error) {
       if (_authState == AuthState.authorized) return true;
-      _errorMessage = _errorMessage.isNotEmpty
-          ? _errorMessage
-          : 'Timed out verifying password';
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out. Try again.';
       notifyListeners();
       return false;
     }
@@ -495,12 +404,12 @@ class TelegramService extends ChangeNotifier {
     try {
       await _request({'@type': 'logOut'});
     } catch (_) {}
-    _isLoggedIn = false;
     _authState = AuthState.waitingPhone;
+    _isLoggedIn = false;
     notifyListeners();
   }
 
-  // ── Resolve Telegram link ───────────────────────────────────────────────────
+  // ── Resolve Telegram link ──────────────────────────────────────────────────
 
   Future<TelegramFile?> resolveLink(String link) async {
     _errorMessage = '';
@@ -546,7 +455,7 @@ class TelegramService extends ChangeNotifier {
       case 'messageVideoNote':
         return _parseVideoNote(content);
       default:
-        _errorMessage = 'Unsupported type: ${content['@type']}';
+        _errorMessage = 'Unsupported message type: ${content['@type']}';
         notifyListeners();
         return null;
     }
@@ -683,7 +592,7 @@ class TelegramService extends ChangeNotifier {
     return (f?['local'] as Map<String, dynamic>?)?['path'] as String?;
   }
 
-  // ── Streaming ───────────────────────────────────────────────────────────────
+  // ── Streaming ──────────────────────────────────────────────────────────────
 
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -708,7 +617,7 @@ class TelegramService extends ChangeNotifier {
       final f = io.File(path);
       if (!await f.exists()) return null;
 
-      final prefixSize = (local?['downloaded_prefix_size'] as int?) ?? 0;
+      final prefixSize = local?['downloaded_prefix_size'] as int? ?? 0;
       final available = (prefixSize - offset).clamp(0, count);
       if (available <= 0) return Uint8List(0);
 
@@ -720,15 +629,14 @@ class TelegramService extends ChangeNotifier {
         await raf.close();
       }
     } catch (e) {
-      debugPrint('downloadFilePart: $e');
+      debugPrint('downloadFilePart error: $e');
       return null;
     }
   }
 
   Future<int> getFileSize(int fileId) async {
     try {
-      final res =
-          await _request({'@type': 'getFile', 'file_id': fileId});
+      final res = await _request({'@type': 'getFile', 'file_id': fileId});
       if (res == null || res['@type'] == 'error') return 0;
       final s = res['size'] as int? ?? 0;
       return s > 0 ? s : (res['expected_size'] as int? ?? 0);
@@ -737,33 +645,41 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // ── Low-level send/receive ──────────────────────────────────────────────────
+  // ── Low-level ─────────────────────────────────────────────────────────────
 
   void _send(Map<String, dynamic> req) {
-    _bgPort?.send(_SendRequest(jsonEncode(req)));
+    try {
+      TdPlugin.instance.tdSend(_clientId, jsonEncode(req));
+    } catch (e) {
+      debugPrint('_send error: $e');
+    }
   }
 
-  Future<Map<String, dynamic>?> _request(Map<String, dynamic> req) async {
-    if (_bgPort == null) return null;
-    final extra = DateTime.now().microsecondsSinceEpoch.toString();
+  Future<Map<String, dynamic>?> _request(
+    Map<String, dynamic> req, {
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final extra = '${req['@type']}_${DateTime.now().microsecondsSinceEpoch}';
     req['@extra'] = extra;
 
     final completer = Completer<Map<String, dynamic>?>();
     late StreamSubscription<Map<String, dynamic>> sub;
-    sub = _updates.stream.listen((u) {
-      if (u['@extra'] == extra && !completer.isCompleted) {
+
+    sub = _updates.listen((u) {
+      if (completer.isCompleted) return;
+      if (u['@extra'] == extra) {
         completer.complete(u);
         sub.cancel();
       }
     });
 
-    _bgPort!.send(_SendRequest(jsonEncode(req)));
+    _send(req);
 
     return completer.future.timeout(
-      const Duration(seconds: 30),
+      timeout,
       onTimeout: () {
         sub.cancel();
-        debugPrint('TDLib timeout: ${req['@type']}');
+        debugPrint('_request timeout: ${req['@type']}');
         return null;
       },
     );
@@ -771,11 +687,7 @@ class TelegramService extends ChangeNotifier {
 
   @override
   void dispose() {
-    _isolate?.kill(priority: Isolate.immediate);
-    _isolate = null;
-    _uiPort?.close();
-    _uiPort = null;
-    _updates.close();
+    _updateCtrl.close();
     super.dispose();
   }
 }
