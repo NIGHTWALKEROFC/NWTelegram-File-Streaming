@@ -14,11 +14,15 @@ dependencies:
   # TDLib v1.8.36, correct namespace in android/build.gradle
   handy_tdlib: ^2.3.10
 
-  # Video player
-  video_player: ^2.8.3
-  chewie: ^1.7.4
+  # ── Video/Audio player (replaces video_player + chewie) ──────────────────
+  # media_kit uses libmpv/FFmpeg under the hood — same engine as VLC/MPV.
+  # Supports HEVC/H.265, AV1, MKV, TS, FLAC, OPUS, and every other format
+  # ExoPlayer rejects.
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.4
+  media_kit_libs_android_video: ^1.3.4   # FFmpeg native libs for Android
 
-  # Audio player
+  # Audio player (kept for audio-only files, lighter than media_kit for audio)
   just_audio: ^0.9.36
 
   # Local HTTP proxy server for streaming
@@ -65,5 +69,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  # assets section removed — no assets/ folder exists in the project.
-  # Add it back only if you create the folder and put files in it.
