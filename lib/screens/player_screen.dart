@@ -161,7 +161,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       s.cancel();
     }
     _subs.clear();
-    _videoController?.dispose();
+    // VideoController does NOT have a dispose() method in media_kit.
+    // Only Player needs to be disposed — it cleans up the controller too.
     _videoController = null;
     _player?.dispose();
     _player = null;
@@ -249,24 +250,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
       normal: MaterialVideoControlsThemeData(
         // Control bar colours
         controlsHoverDuration: const Duration(seconds: 4),
-        seekBarColor: const Color(0xFF2AABEE),
+        seekBarColor: const Color(0xFF3A3A5A),
         seekBarPositionColor: const Color(0xFF2AABEE),
         seekBarThumbColor: const Color(0xFF2AABEE),
-        seekBarBufferedColor: const Color(0xFF2AABEE).withOpacity(0.3),
         primaryButtonBar: [
-          const Spacer(),
-          MaterialSkipPreviousButton(),
           const Spacer(),
           MaterialPlayOrPauseButton(iconSize: 48),
           const Spacer(),
-          MaterialSkipNextButton(),
-          const Spacer(),
         ],
         topButtonBar: [
-          // Back button
-          MaterialDesktopCustomButton(
-            onPressed: () => Navigator.pop(context),
-            icon: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
+          // Back button — plain widget, works on all platforms
+          GestureDetector(
+            onTap: () => Navigator.pop(context),
+            child: Container(
+              margin: const EdgeInsets.only(left: 4),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.45),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.arrow_back,
+                  color: Colors.white, size: 20),
+            ),
           ),
           const Spacer(),
           // Quality badge
@@ -293,8 +298,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         bottomButtonBar: [
           const MaterialPositionIndicator(),
           const Spacer(),
-          MaterialSpeedButton(),
-          MaterialFullscreenButton(),
+          const MaterialSpeedButton(),
+          const MaterialFullscreenButton(),
         ],
         volumeGesture: true,
         brightnessGesture: true,
