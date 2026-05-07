@@ -1,32 +1,18 @@
 // lib/services/telegram_service.dart
 //
-// DEFINITIVE FIX — Why all previous versions failed:
-// ===================================================
+// KEY FIX for "document streaming not supported":
+// ================================================
+// Telegram sends files like .mkv, .mp4, .avi as messageDocument — not as
+// messageVideo. So _parseDocument() was always creating TelegramFileType.document
+// regardless of whether the file was actually a video or audio.
 //
-// Version 1 — background Isolate + tdReceive(1.0):
-//   FAILED: handy_tdlib's TdPlugin is registered only on the MAIN Flutter
-//   isolate. Spawned isolates have no plugin registry, so tdReceive always
-//   returned null. Every update was silently dropped.
+// Fix: _parseDocument now checks mime type AND file extension to assign the
+// correct TelegramFileType. Combined with the updated TelegramFile.isVideo /
+// isAudio getters, all video/audio files now route to the correct player.
 //
-// Version 2 — compute() + tdReceive(1.0):
-//   FAILED: compute() spawns a new isolate internally. Same problem as above.
-//   TdPlugin.instance in that isolate has no client, always returns null.
-//
-// CORRECT APPROACH — this file:
-// ================================
-// Run EVERYTHING on the MAIN isolate using Timer.periodic every 10 ms
-// with tdReceive(0.0) (non-blocking). Because it runs on the main isolate
-// where TdPlugin is properly registered, every TDLib event is captured
-// immediately. 10 ms polling = imperceptible latency. CPU cost is near-zero
-// since tdReceive(0.0) is a native no-op when nothing is queued.
-//
-// This is the correct pattern used by all working Flutter TDLib apps.
-//
-// KEY FIX for "could not send verification code":
-// sendPhoneNumber() now subscribes to the raw update stream BEFORE sending
-// the request, then waits for authorizationStateWaitCode directly. It no
-// longer relies on _request()/@extra matching, which was unreliable because
-// setAuthenticationPhoneNumber does not always echo @extra in its response.
+// Polling architecture (unchanged from last working version):
+// - Timer.periodic(10ms) + tdReceive(0.0) on MAIN isolate
+// - No background isolates, no compute() — plugin registered on main isolate
 
 import 'dart:async';
 import 'dart:convert';
@@ -58,8 +44,6 @@ class TelegramService extends ChangeNotifier {
   Timer? _pollTimer;
 
   final _updateCtrl = StreamController<Map<String, dynamic>>.broadcast();
-
-  /// All raw TDLib updates — subscribe here to react to any event
   Stream<Map<String, dynamic>> get updates => _updateCtrl.stream;
 
   AuthState _authState = AuthState.idle;
@@ -80,19 +64,17 @@ class TelegramService extends ChangeNotifier {
     if (_kApiId == 0 || _kApiHash.isEmpty) {
       _errorMessage =
           'Telegram API credentials missing.\n'
-          'Set TG_API_ID and TG_API_HASH in Codemagic → '
-          'Environment Variables (group: telegram_keys).';
+          'Set TG_API_ID and TG_API_HASH in Codemagic → Environment Variables '
+          '(group: telegram_keys).';
       _authState = AuthState.error;
       notifyListeners();
       return;
     }
 
     try {
-      // MUST be called on the main isolate — registers the Flutter plugin
       TdPlugin.initialize();
       _clientId = TdPlugin.instance.tdCreateClientId();
 
-      // Start polling BEFORE sending any request so no event is missed
       _startPolling();
 
       final appDir = await getApplicationDocumentsDirectory();
@@ -121,7 +103,6 @@ class TelegramService extends ChangeNotifier {
 
       _isInitialized = true;
 
-      // Wait for first auth state update — max 10 s
       await updates
           .where((u) => u['@type'] == 'updateAuthorizationState')
           .first
@@ -134,14 +115,13 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // ── Polling loop — main isolate, 10 ms, non-blocking ──────────────────────
+  // ── Polling loop ───────────────────────────────────────────────────────────
 
   void _startPolling() {
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(const Duration(milliseconds: 10), (_) {
       if (_updateCtrl.isClosed) return;
       try {
-        // tdReceive(0.0) = return immediately; null if nothing queued
         final raw = TdPlugin.instance.tdReceive(0.0);
         if (raw != null && raw.isNotEmpty) {
           _onRawUpdate(raw);
@@ -179,41 +159,32 @@ class TelegramService extends ChangeNotifier {
       case 'authorizationStateWaitTdlibParameters':
         _authState = AuthState.idle;
         break;
-
       case 'authorizationStateWaitEncryptionKey':
-        // Must respond immediately — otherwise auth chain hangs here forever
         _send({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''});
-        return; // skip notifyListeners — not a real user-facing state
-
+        return;
       case 'authorizationStateWaitPhoneNumber':
         _authState = AuthState.waitingPhone;
         _isLoggedIn = false;
         break;
-
       case 'authorizationStateWaitCode':
         _authState = AuthState.waitingCode;
         break;
-
       case 'authorizationStateWaitOtherDeviceConfirmation':
         _authState = AuthState.waitingCode;
         _errorMessage =
             'Please confirm this login on your other Telegram app or device.';
         break;
-
       case 'authorizationStateWaitRegistration':
         _authState = AuthState.waitingRegistration;
         break;
-
       case 'authorizationStateWaitPassword':
         _authState = AuthState.waitingPassword;
         break;
-
       case 'authorizationStateReady':
         _authState = AuthState.authorized;
         _isLoggedIn = true;
         _errorMessage = '';
         break;
-
       case 'authorizationStateLoggingOut':
       case 'authorizationStateClosing':
       case 'authorizationStateClosed':
@@ -221,17 +192,10 @@ class TelegramService extends ChangeNotifier {
         _isLoggedIn = false;
         break;
     }
-
     notifyListeners();
   }
 
   // ── Auth actions ───────────────────────────────────────────────────────────
-  //
-  // All three auth methods follow the same pattern:
-  // 1. Subscribe to the raw update stream BEFORE sending the request
-  // 2. Send the request via _send() (fire-and-forget, no @extra needed)
-  // 3. Wait for the expected authorizationState update or an error update
-  // 4. Synchronous double-check after subscribing to close the race window
 
   Future<bool> sendPhoneNumber(String phone) async {
     _errorMessage = '';
@@ -241,17 +205,13 @@ class TelegramService extends ChangeNotifier {
 
     sub = updates.listen((u) {
       if (completer.isCompleted) return;
-
-      // Explicit error from TDLib (bad format, flood wait, etc.)
       if (u['@type'] == 'error') {
-        final msg = u['message'] as String? ?? 'Error sending code';
-        _errorMessage = msg;
+        _errorMessage = u['message'] as String? ?? 'Error sending code';
         notifyListeners();
         completer.complete(false);
         sub.cancel();
         return;
       }
-
       if (u['@type'] == 'updateAuthorizationState') {
         final type =
             (u['authorization_state'] as Map<String, dynamic>?)?['@type']
@@ -266,7 +226,6 @@ class TelegramService extends ChangeNotifier {
       }
     });
 
-    // Send AFTER subscribing — never miss a response
     _send({
       '@type': 'setAuthenticationPhoneNumber',
       'phone_number': phone,
@@ -279,7 +238,6 @@ class TelegramService extends ChangeNotifier {
       },
     });
 
-    // Synchronous check — state may already be set from a prior update
     if (!completer.isCompleted &&
         (_authState == AuthState.waitingCode ||
             _authState == AuthState.waitingPassword ||
@@ -292,7 +250,6 @@ class TelegramService extends ChangeNotifier {
       const Duration(seconds: 60),
       onTimeout: () {
         sub.cancel();
-        // Final check before reporting failure
         if (_authState == AuthState.waitingCode ||
             _authState == AuthState.waitingPassword ||
             _authState == AuthState.authorized) return true;
@@ -527,17 +484,40 @@ class TelegramService extends ChangeNotifier {
     );
   }
 
+  // ── KEY FIX: _parseDocument now detects real type from mime + extension ─────
+  //
+  // Telegram sends .mkv, .mp4, .avi etc. as messageDocument.
+  // We check mime type first, then fall back to file extension.
+  // This means a .mkv file correctly gets isVideo=true and plays in the
+  // video player instead of showing the dead-end document screen.
+
   TelegramFile? _parseDocument(Map<String, dynamic> content) {
     final doc = content['document'] as Map<String, dynamic>?;
     final file = doc?['document'] as Map<String, dynamic>?;
     if (doc == null || file == null) return null;
+
+    final fileName = doc['file_name'] as String? ?? 'file';
+    final mimeType = doc['mime_type'] as String? ?? 'application/octet-stream';
+
+    // Determine the real type from mime, then fall back to extension
+    TelegramFileType realType;
+    if (TelegramFile._mimeIsVideo(mimeType)) {
+      realType = TelegramFileType.video;
+    } else if (TelegramFile._mimeIsAudio(mimeType)) {
+      realType = TelegramFileType.audio;
+    } else {
+      // Mime was not conclusive — check extension
+      realType = TelegramFile.typeFromExtension(fileName);
+    }
+
     return TelegramFile(
-      type: TelegramFileType.document,
-      name: doc['file_name'] as String? ?? 'file',
-      mimeType: doc['mime_type'] as String? ?? 'application/octet-stream',
+      type: realType,
+      name: fileName,
+      mimeType: mimeType,
       fileId: file['id'] as int? ?? 0,
       fileSize: _sz(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
+      thumbnail: _thumbPath(doc['thumbnail']),
       qualities: [],
     );
   }
