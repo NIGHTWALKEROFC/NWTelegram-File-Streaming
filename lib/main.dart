@@ -1,7 +1,10 @@
+// lib/main.dart
+
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
 import 'package:provider/provider.dart';
 
 import 'services/telegram_service.dart';
@@ -13,6 +16,10 @@ void main() async {
   // Must be first — required before any platform channel or plugin call
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Initialize media_kit (libmpv/FFmpeg) — must be called before any
+  // Player or VideoController is created.
+  MediaKit.ensureInitialized();
+
   // Catch all Flutter framework errors (widget build errors, etc.)
   FlutterError.onError = (FlutterErrorDetails details) {
     FlutterError.presentError(details);
@@ -22,7 +29,7 @@ void main() async {
   // Catch all errors outside the Flutter framework (async errors, isolate errors)
   PlatformDispatcher.instance.onError = (error, stack) {
     debugPrint('PlatformDispatcher error: $error\n$stack');
-    return true; // return true = handled, prevents app crash
+    return true;
   };
 
   await SystemChrome.setPreferredOrientations([
@@ -130,8 +137,6 @@ class TelegramStreamerApp extends StatelessWidget {
 
 // ──────────────────────────────────────────────────────────
 // SplashRouter
-// Shows animated splash, initializes TDLib, then routes to
-// LoginScreen or HomeScreen based on auth state.
 // ──────────────────────────────────────────────────────────
 class SplashRouter extends StatefulWidget {
   const SplashRouter({super.key});
@@ -161,13 +166,10 @@ class _SplashRouterState extends State<SplashRouter>
     );
     _controller.forward();
 
-    // Delay init until after the first frame so the plugin registry
-    // is fully set up — prevents MissingPluginException on cold start.
     WidgetsBinding.instance.addPostFrameCallback((_) => _init());
   }
 
   Future<void> _init() async {
-    // Show splash for at least 1.5 s so the animation completes
     await Future.delayed(const Duration(milliseconds: 1500));
     if (!mounted) return;
 
