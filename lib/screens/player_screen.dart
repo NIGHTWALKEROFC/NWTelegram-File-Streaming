@@ -1,12 +1,13 @@
 // lib/screens/player_screen.dart
 
-import 'dart:async'; // required for StreamSubscription
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:chewie/chewie.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models/telegram_file.dart';
 
@@ -38,16 +39,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
 
-  // Store subscriptions to cancel them on dispose — prevents
-  // "setState() called after dispose()" crashes.
   final List<StreamSubscription<dynamic>> _subs = [];
 
   @override
   void initState() {
     super.initState();
-    // Small delay so the local proxy has time to bind before the player
-    // makes its first HTTP request.
-    Future.delayed(const Duration(milliseconds: 400), _initPlayer);
+    // Documents skip player init — show UI immediately
+    if (widget.file.isDocument) {
+      setState(() => _isInitializing = false);
+    } else {
+      Future.delayed(const Duration(milliseconds: 400), _initPlayer);
+    }
   }
 
   Future<void> _initPlayer() async {
@@ -94,11 +96,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final qualityLabel = widget.selectedQuality?.label ??
         (widget.file.height > 0 ? '${widget.file.height}p' : '');
 
-    // IMPORTANT: Chewie's `overlay` must NOT be a Positioned widget.
-    // Positioned only works directly inside a Stack. Passing it as
-    // ChewieController.overlay crashes with:
-    //   "Positioned widgets must be placed directly inside a Stack."
-    // Use Align instead — it works anywhere.
     Widget? overlay;
     if (qualityLabel.isNotEmpty) {
       overlay = Align(
@@ -174,16 +171,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _disposeControllers() {
-    // Cancel subscriptions FIRST to stop callbacks on disposed objects.
     for (final s in _subs) {
       s.cancel();
     }
     _subs.clear();
 
     _videoController?.removeListener(_onVideoError);
-
-    // Dispose ChewieController BEFORE VideoPlayerController.
-    // Reverse order causes "VideoPlayerController was disposed" inside Chewie.
     _chewieController?.dispose();
     _chewieController = null;
     _videoController?.dispose();
@@ -195,7 +188,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
-    // Restore portrait in case the user exits from fullscreen landscape.
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
@@ -204,19 +196,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.dispose();
   }
 
-  // ──────────────────────────────────────────
-  // Build
-  // ──────────────────────────────────────────
+  // ── Build ──────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
+    // Video in fullscreen mode has no AppBar — everything else does
+    final showAppBar =
+        !widget.file.isVideo || _isInitializing || _initError != null;
+
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: widget.file.isVideo ? null : _buildAudioAppBar(),
+      backgroundColor: const Color(0xFF0A0A0F),
+      appBar: showAppBar ? _buildAppBar() : null,
       body: _buildBody(),
     );
   }
 
-  AppBar _buildAudioAppBar() {
+  AppBar _buildAppBar() {
     return AppBar(
       backgroundColor: const Color(0xFF0A0A0F),
       leading: IconButton(
@@ -232,35 +227,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Widget _buildBody() {
-    if (_isInitializing) {
-      return const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(
-                color: Color(0xFF2AABEE), strokeWidth: 2),
-            SizedBox(height: 20),
-            Text(
-              'Connecting to stream...',
-              style: TextStyle(color: Color(0xFF9090B0), fontSize: 15),
-            ),
-          ],
-        ),
-      );
-    }
+    if (_isInitializing) return _buildLoading();
     if (_initError != null) return _buildErrorView();
     if (widget.file.isVideo) return _buildVideoView();
     if (widget.file.isAudio) return _buildAudioView();
     return _buildDocumentView();
   }
 
+  Widget _buildLoading() {
+    return const Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          CircularProgressIndicator(color: Color(0xFF2AABEE), strokeWidth: 2),
+          SizedBox(height: 20),
+          Text(
+            'Connecting to stream...',
+            style: TextStyle(color: Color(0xFF9090B0), fontSize: 15),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Video view ─────────────────────────────────────────────────────────────
+
   Widget _buildVideoView() {
     final ctrl = _chewieController;
     final val = _videoController?.value;
-    if (ctrl == null || val == null || !val.isInitialized || val.aspectRatio <= 0) {
+    if (ctrl == null ||
+        val == null ||
+        !val.isInitialized ||
+        val.aspectRatio <= 0) {
       return const Center(
-        child: CircularProgressIndicator(
-            color: Color(0xFF2AABEE), strokeWidth: 2),
+        child:
+            CircularProgressIndicator(color: Color(0xFF2AABEE), strokeWidth: 2),
       );
     }
     return Stack(
@@ -283,8 +284,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   color: Colors.black.withOpacity(0.5),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: const Icon(Icons.arrow_back,
-                    color: Colors.white, size: 20),
+                child: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
+              ),
+            ),
+          ),
+        ),
+        // Stream URL chip in the corner — always visible in video view
+        Positioned(
+          bottom: 8,
+          right: 8,
+          child: SafeArea(
+            child: GestureDetector(
+              onTap: () => _showStreamUrlSheet(context),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
+                    SizedBox(width: 4),
+                    Text(
+                      'Stream URL',
+                      style: TextStyle(color: Colors.white, fontSize: 11),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -292,6 +321,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ],
     );
   }
+
+  // ── Audio view ─────────────────────────────────────────────────────────────
 
   Widget _buildAudioView() {
     final progress = _audioDuration.inMilliseconds > 0
@@ -330,9 +361,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Text(
             widget.file.name,
             style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w600),
+                color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
@@ -349,8 +378,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               inactiveTrackColor: const Color(0xFF3A3A5A),
               thumbColor: const Color(0xFF9B59B6),
               trackHeight: 4,
-              thumbShape:
-                  const RoundSliderThumbShape(enabledThumbRadius: 8),
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
             ),
             child: Slider(
               value: progress,
@@ -382,13 +410,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
             children: [
               IconButton(
                 iconSize: 32,
-                icon:
-                    const Icon(Icons.replay_10_rounded, color: Colors.white),
+                icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
                 onPressed: () {
-                  final p =
-                      _audioPosition - const Duration(seconds: 10);
-                  _audioPlayer?.seek(
-                      p < Duration.zero ? Duration.zero : p);
+                  final p = _audioPosition - const Duration(seconds: 10);
+                  _audioPlayer?.seek(p < Duration.zero ? Duration.zero : p);
                 },
               ),
               const SizedBox(width: 16),
@@ -422,70 +447,328 @@ class _PlayerScreenState extends State<PlayerScreen> {
               const SizedBox(width: 16),
               IconButton(
                 iconSize: 32,
-                icon: const Icon(Icons.forward_30_rounded,
-                    color: Colors.white),
+                icon: const Icon(Icons.forward_30_rounded, color: Colors.white),
                 onPressed: () {
-                  final p =
-                      _audioPosition + const Duration(seconds: 30);
-                  _audioPlayer?.seek(
-                      p > _audioDuration ? _audioDuration : p);
+                  final p = _audioPosition + const Duration(seconds: 30);
+                  _audioPlayer
+                      ?.seek(p > _audioDuration ? _audioDuration : p);
                 },
               ),
             ],
+          ),
+          const SizedBox(height: 32),
+          // Stream URL section for audio too
+          _buildStreamUrlRow(),
+        ],
+      ),
+    );
+  }
+
+  // ── Document view ──────────────────────────────────────────────────────────
+  // For truly non-playable files (PDFs, ZIPs, etc.)
+  // Shows the stream URL so user can copy it or open in browser.
+  // By the time we reach here, isVideo/isAudio are already false
+  // (handled correctly by TelegramFile's mime+extension detection).
+
+  Widget _buildDocumentView() {
+    final mime = widget.file.mimeType.toLowerCase();
+
+    final IconData fileIcon;
+    final Color iconColor;
+
+    if (mime.contains('pdf')) {
+      fileIcon = Icons.picture_as_pdf_rounded;
+      iconColor = const Color(0xFFE74C3C);
+    } else if (mime.contains('zip') ||
+        mime.contains('rar') ||
+        mime.contains('7z') ||
+        mime.contains('tar') ||
+        mime.contains('gz')) {
+      fileIcon = Icons.folder_zip_rounded;
+      iconColor = const Color(0xFFF39C12);
+    } else if (mime.contains('word') ||
+        mime.contains('msword') ||
+        mime.contains('document')) {
+      fileIcon = Icons.description_rounded;
+      iconColor = const Color(0xFF2980B9);
+    } else if (mime.contains('sheet') ||
+        mime.contains('excel') ||
+        mime.contains('spreadsheet')) {
+      fileIcon = Icons.table_chart_rounded;
+      iconColor = const Color(0xFF27AE60);
+    } else if (mime.contains('presentation') || mime.contains('powerpoint')) {
+      fileIcon = Icons.slideshow_rounded;
+      iconColor = const Color(0xFFE67E22);
+    } else if (mime.contains('text') ||
+        mime.contains('json') ||
+        mime.contains('xml')) {
+      fileIcon = Icons.text_snippet_rounded;
+      iconColor = const Color(0xFF9090B0);
+    } else if (mime.contains('image')) {
+      fileIcon = Icons.image_rounded;
+      iconColor = const Color(0xFF9B59B6);
+    } else {
+      fileIcon = Icons.insert_drive_file_rounded;
+      iconColor = const Color(0xFF27AE60);
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const SizedBox(height: 16),
+          Container(
+            width: 100,
+            height: 100,
+            decoration: BoxDecoration(
+              color: iconColor.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(24),
+            ),
+            child: Icon(fileIcon, color: iconColor, size: 52),
+          ),
+          const SizedBox(height: 20),
+          Text(
+            widget.file.name,
+            style: const TextStyle(
+                color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+            textAlign: TextAlign.center,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              _badge(widget.file.readableSize),
+              const SizedBox(width: 8),
+              _badge(
+                  widget.file.mimeType.split('/').last.toUpperCase()),
+            ],
+          ),
+          const SizedBox(height: 32),
+
+          // Stream URL box
+          _buildStreamUrlBox(),
+          const SizedBox(height: 16),
+
+          // Copy button
+          _buildCopyButton(),
+          const SizedBox(height: 12),
+
+          // Open in browser button
+          _buildOpenInBrowserButton(),
+          const SizedBox(height: 20),
+
+          // Info hint
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0F1020),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0xFF2A2A40)),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.info_outline_rounded,
+                    color: Color(0xFF2AABEE), size: 16),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'The stream URL is a live HTTP link served directly from '
+                    'this device. Open it in a browser, VLC, MX Player, or any '
+                    'app that supports HTTP streaming.',
+                    style: TextStyle(
+                      color: Color(0xFF7070A0),
+                      fontSize: 12,
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildDocumentView() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(28),
+  // ── Shared stream URL widgets ──────────────────────────────────────────────
+
+  Widget _buildStreamUrlBox() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF141420),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF2A2A40)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
+              SizedBox(width: 6),
+              Text(
+                'Stream URL',
+                style: TextStyle(
+                  color: Color(0xFF2AABEE),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SelectableText(
+            widget.streamUrl,
+            style: const TextStyle(
+              color: Color(0xFF9090B0),
+              fontSize: 12,
+              fontFamily: 'monospace',
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStreamUrlRow() {
+    return Column(
+      children: [
+        _buildStreamUrlBox(),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(child: _buildCopyButton()),
+            const SizedBox(width: 10),
+            Expanded(child: _buildOpenInBrowserButton()),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCopyButton() {
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton.icon(
+        onPressed: () {
+          Clipboard.setData(ClipboardData(text: widget.streamUrl));
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('Stream URL copied!'),
+              backgroundColor: const Color(0xFF27AE60),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8)),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        },
+        icon: const Icon(Icons.copy_rounded, size: 16),
+        label: const Text('Copy URL'),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: Colors.white,
+          side: const BorderSide(color: Color(0xFF3A3A5A)),
+          padding: const EdgeInsets.symmetric(vertical: 13),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12)),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOpenInBrowserButton() {
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton.icon(
+        onPressed: _openInBrowser,
+        icon: const Icon(Icons.open_in_browser_rounded, size: 16),
+        label: const Text('Open in Browser'),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF2AABEE),
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 13),
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12)),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openInBrowser() async {
+    final uri = Uri.parse(widget.streamUrl);
+    try {
+      final launched =
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!launched && mounted) {
+        _showSnackError(
+            'Could not open browser. Copy the URL and paste it manually.');
+      }
+    } catch (e) {
+      if (mounted) {
+        _showSnackError('Error: $e');
+      }
+    }
+  }
+
+  void _showStreamUrlSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141420),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.all(24),
         child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
           children: [
             Container(
-              width: 100,
-              height: 100,
+              width: 36,
+              height: 4,
               decoration: BoxDecoration(
-                color: const Color(0xFF27AE60).withOpacity(0.15),
-                borderRadius: BorderRadius.circular(24),
+                color: const Color(0xFF3A3A5A),
+                borderRadius: BorderRadius.circular(2),
               ),
-              child: const Icon(Icons.insert_drive_file_rounded,
-                  color: Color(0xFF27AE60), size: 52),
             ),
-            const SizedBox(height: 24),
-            Text(
-              widget.file.name,
-              style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600),
-              textAlign: TextAlign.center,
+            const SizedBox(height: 20),
+            _buildStreamUrlBox(),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(child: _buildCopyButton()),
+                const SizedBox(width: 10),
+                Expanded(child: _buildOpenInBrowserButton()),
+              ],
             ),
             const SizedBox(height: 8),
-            Text(widget.file.readableSize,
-                style: const TextStyle(
-                    color: Color(0xFF9090B0), fontSize: 14)),
-            const SizedBox(height: 32),
-            const Text(
-              'Document streaming is not supported in the player.\n'
-              'The file can be opened in a browser via the stream URL.',
-              style: TextStyle(
-                  color: Color(0xFF7070A0), fontSize: 14, height: 1.5),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 24),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Go Back'),
-            ),
           ],
         ),
       ),
     );
   }
+
+  void _showSnackError(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: const Color(0xFFCF6679),
+        behavior: SnackBarBehavior.floating,
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+    );
+  }
+
+  // ── Error view ─────────────────────────────────────────────────────────────
 
   Widget _buildErrorView() {
     return Center(
@@ -509,7 +792,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 28),
+            const SizedBox(height: 20),
+            // Even on error, show stream URL so user can try external player
+            _buildStreamUrlBox(),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(child: _buildCopyButton()),
+                const SizedBox(width: 10),
+                Expanded(child: _buildOpenInBrowserButton()),
+              ],
+            ),
+            const SizedBox(height: 16),
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
@@ -530,6 +824,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  Widget _badge(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E35),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(color: Color(0xFF9090B0), fontSize: 12),
       ),
     );
   }
