@@ -58,26 +58,22 @@ class TelegramFile {
     required this.qualities,
   });
 
-  // ── Smart type detection from mime type ─────────────────────────────────────
-  // Telegram sends .mkv, .mp4, .avi etc. as messageDocument with a mime type.
-  // We detect what they really are so the right player is used.
+  // ── Type detection ─────────────────────────────────────────────────────────
+  // Telegram sends .mkv, .mp4, .avi etc. as messageDocument.
+  // We detect the real type from mime + extension so the right player is used.
 
-  /// Returns true if this file should be played as video
-  /// (either natively typed as video, or a document with a video mime type)
   bool get isVideo {
     if (type == TelegramFileType.video) return true;
-    if (type == TelegramFileType.document) return _mimeIsVideo(mimeType);
+    if (type == TelegramFileType.document) return mimeIsVideo(mimeType);
     return false;
   }
 
-  /// Returns true if this file should be played as audio
   bool get isAudio {
     if (type == TelegramFileType.audio) return true;
-    if (type == TelegramFileType.document) return _mimeIsAudio(mimeType);
+    if (type == TelegramFileType.document) return mimeIsAudio(mimeType);
     return false;
   }
 
-  /// Returns true only for non-playable documents (PDFs, ZIPs, etc.)
   bool get isDocument => !isVideo && !isAudio;
 
   bool get hasMultipleQualities => qualities.length > 1;
@@ -115,12 +111,13 @@ class TelegramFile {
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
-  // ── Mime helpers ────────────────────────────────────────────────────────────
+  // ── Public static mime/extension helpers ───────────────────────────────────
+  // Public (no underscore) so telegram_service.dart can call them during
+  // parsing, before a TelegramFile instance is created.
 
-  static bool _mimeIsVideo(String mime) {
+  static bool mimeIsVideo(String mime) {
     final m = mime.toLowerCase();
     if (m.startsWith('video/')) return true;
-    // Common video mime types sometimes sent without video/ prefix
     const videoTypes = {
       'application/x-matroska', // .mkv
       'application/mkv',
@@ -128,12 +125,11 @@ class TelegramFile {
       'application/x-mp4',
       'application/mpeg',
       'application/x-mpeg',
-      'application/ogg',
     };
     return videoTypes.contains(m);
   }
 
-  static bool _mimeIsAudio(String mime) {
+  static bool mimeIsAudio(String mime) {
     final m = mime.toLowerCase();
     if (m.startsWith('audio/')) return true;
     const audioTypes = {
@@ -145,13 +141,12 @@ class TelegramFile {
     return audioTypes.contains(m);
   }
 
-  /// Detect type purely from file extension when mime type is ambiguous
+  /// Detect type from file extension when mime type is ambiguous
   static TelegramFileType typeFromExtension(String filename) {
     final ext = filename.toLowerCase().split('.').last;
     const videoExts = {
       'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'mpeg', 'mpg',
-      'm4v', 'ts', '3gp', 'ogv', 'rm', 'rmvb', 'divx', 'xvid', 'hevc',
-      'h264', 'h265',
+      'm4v', 'ts', '3gp', 'ogv', 'rm', 'rmvb', 'divx', 'xvid',
     };
     const audioExts = {
       'mp3', 'aac', 'ogg', 'flac', 'wav', 'm4a', 'opus', 'wma', 'aiff',
