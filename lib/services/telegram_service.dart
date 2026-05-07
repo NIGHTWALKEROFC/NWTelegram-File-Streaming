@@ -350,7 +350,127 @@ class TelegramService extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ── Resolve Telegram link ──────────────────────────────────────────────────
+  // ── Get all chats (returns list of chat IDs) ───────────────────────────────
+
+  Future<List<int>> _getChatIds() async {
+    // First load the chat list so TDLib populates it
+    final res = await _request({
+      '@type': 'loadChats',
+      'chat_list': {'@type': 'chatListMain'},
+      'limit': 100,
+    });
+    // loadChats returns ok or error — both are fine, we then call getChats
+    debugPrint('loadChats result: ${res?['@type']}');
+
+    final chatsRes = await _request({
+      '@type': 'getChats',
+      'chat_list': {'@type': 'chatListMain'},
+      'limit': 100,
+    });
+
+    if (chatsRes == null || chatsRes['@type'] == 'error') {
+      debugPrint('getChats error: ${chatsRes?['message']}');
+      return [];
+    }
+
+    final ids = (chatsRes['chat_ids'] as List?)
+            ?.map((e) => e as int)
+            .toList() ??
+        [];
+    debugPrint('getChats returned ${ids.length} chats');
+    return ids;
+  }
+
+  // ── Fetch media files from a single chat ──────────────────────────────────
+  //
+  // Uses searchChatMessages with a filter so only document/video/audio
+  // messages are returned — much more efficient than fetching all messages.
+
+  Future<List<TelegramFile>> _getMediaFromChat({
+    required int chatId,
+    required int limit,
+  }) async {
+    final filters = [
+      'searchMessagesFilterVideo',
+      'searchMessagesFilterAudio',
+      'searchMessagesFilterDocument',
+      'searchMessagesFilterVoiceNote',
+      'searchMessagesFilterVideoNote',
+    ];
+
+    final files = <TelegramFile>[];
+
+    for (final filter in filters) {
+      final res = await _request(
+        {
+          '@type': 'searchChatMessages',
+          'chat_id': chatId,
+          'query': '',
+          'from_message_id': 0,
+          'offset': 0,
+          'limit': limit,
+          'filter': {'@type': filter},
+          'message_thread_id': 0,
+        },
+        timeout: const Duration(seconds: 20),
+      );
+
+      if (res == null || res['@type'] == 'error') continue;
+
+      final messages = res['messages'] as List? ?? [];
+      for (final msg in messages) {
+        final file = _parseMessage(msg as Map<String, dynamic>);
+        if (file != null && file.fileId > 0) {
+          files.add(file);
+        }
+      }
+    }
+
+    return files;
+  }
+
+  // ── PUBLIC: Load all media files across all chats ─────────────────────────
+  //
+  // Called from FilesScreen on first load and on pull-to-refresh.
+  // [limitPerChat] controls how many messages per filter per chat to fetch.
+  // We use 50 by default — enough for a full screen without being too slow.
+
+  Future<List<TelegramFile>> getAllMediaFiles({int limitPerChat = 50}) async {
+    try {
+      final chatIds = await _getChatIds();
+      if (chatIds.isEmpty) return [];
+
+      final allFiles = <TelegramFile>[];
+
+      // Fetch chats in parallel with a concurrency cap of 5
+      // to avoid TDLib rate limiting
+      const concurrency = 5;
+      for (int i = 0; i < chatIds.length; i += concurrency) {
+        final batch = chatIds.skip(i).take(concurrency).toList();
+        final results = await Future.wait(
+          batch.map(
+            (id) => _getMediaFromChat(chatId: id, limit: limitPerChat)
+                .catchError((e) {
+              debugPrint('Error fetching chat $id: $e');
+              return <TelegramFile>[];
+            }),
+          ),
+        );
+        for (final r in results) {
+          allFiles.addAll(r);
+        }
+      }
+
+      // Sort: largest files first (most likely to be the important ones)
+      allFiles.sort((a, b) => b.fileSize.compareTo(a.fileSize));
+      return allFiles;
+    } catch (e, st) {
+      debugPrint('getAllMediaFiles error: $e\n$st');
+      return [];
+    }
+  }
+
+  // ── Resolve Telegram link (kept for backward compat) ──────────────────────
 
   Future<TelegramFile?> resolveLink(String link) async {
     _errorMessage = '';
@@ -381,6 +501,8 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
+  // ── Message parser ─────────────────────────────────────────────────────────
+
   TelegramFile? _parseMessage(Map<String, dynamic> message) {
     final content = message['content'] as Map<String, dynamic>?;
     if (content == null) return null;
@@ -396,8 +518,6 @@ class TelegramService extends ChangeNotifier {
       case 'messageVideoNote':
         return _parseVideoNote(content);
       default:
-        _errorMessage = 'Unsupported message type: ${content['@type']}';
-        notifyListeners();
         return null;
     }
   }
@@ -470,7 +590,6 @@ class TelegramService extends ChangeNotifier {
     );
   }
 
-  // Detects real type from mime + extension for files sent as documents
   TelegramFile? _parseDocument(Map<String, dynamic> content) {
     final doc = content['document'] as Map<String, dynamic>?;
     final file = doc?['document'] as Map<String, dynamic>?;
@@ -550,14 +669,6 @@ class TelegramService extends ChangeNotifier {
   }
 
   // ── Streaming ──────────────────────────────────────────────────────────────
-  //
-  // downloadFilePart: asks TDLib to download [offset, offset+count) of the
-  // file and reads those bytes from the local cache file.
-  //
-  // TDLib's downloadFile(synchronous:true) blocks until the requested prefix
-  // is available. We then read exactly the bytes we need from the local file.
-  // If downloaded_prefix_size < offset+count, we return what's available so
-  // the stream_service retry loop can request more.
 
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -565,7 +676,6 @@ class TelegramService extends ChangeNotifier {
     required int count,
   }) async {
     try {
-      // Step 1: Tell TDLib to download up to offset+count bytes synchronously
       final res = await _request(
         {
           '@type': 'downloadFile',
@@ -599,18 +709,12 @@ class TelegramService extends ChangeNotifier {
       final file = io.File(path);
       if (!await file.exists()) return null;
 
-      // How many bytes are actually available starting from offset
       final available = (prefixSize - offset).clamp(0, count);
       if (available <= 0) {
-        // TDLib hasn't buffered this range yet
-        if (isDownloading) {
-          // Return null so stream_service retries after a delay
-          return null;
-        }
-        return Uint8List(0); // EOF
+        if (isDownloading) return null;
+        return Uint8List(0);
       }
 
-      // Step 2: Read the available bytes from the local file
       final raf = await file.open();
       try {
         await raf.setPosition(offset);
