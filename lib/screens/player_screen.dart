@@ -45,10 +45,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void initState() {
     super.initState();
     if (widget.file.isDocument) {
-      // Documents need no player — show UI immediately
       setState(() => _isInitializing = false);
     } else {
-      Future.delayed(const Duration(milliseconds: 400), _initPlayer);
+      Future.delayed(const Duration(milliseconds: 300), _initPlayer);
     }
   }
 
@@ -58,7 +57,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _isInitializing = true;
       _initError = null;
     });
-
     _disposeControllers();
 
     try {
@@ -72,7 +70,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (mounted) {
         setState(() {
           _isInitializing = false;
-          _initError = 'Failed to start player:\n$e';
+          _initError = e.toString();
         });
       }
       return;
@@ -83,43 +81,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _initVideoPlayer() async {
     final uri = Uri.parse(widget.streamUrl);
-
     _videoController = VideoPlayerController.networkUrl(
       uri,
       httpHeaders: const {'Accept': '*/*', 'Connection': 'keep-alive'},
     );
-
     _videoController!.addListener(_onVideoError);
     await _videoController!.initialize();
     if (!mounted) return;
 
     final qualityLabel = widget.selectedQuality?.label ??
         (widget.file.height > 0 ? '${widget.file.height}p' : '');
-
-    Widget? overlay;
-    if (qualityLabel.isNotEmpty) {
-      overlay = Align(
-        alignment: Alignment.topRight,
-        child: Padding(
-          padding: const EdgeInsets.only(top: 12, right: 12),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.6),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Text(
-              qualityLabel,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-        ),
-      );
-    }
 
     _chewieController = ChewieController(
       videoPlayerController: _videoController!,
@@ -141,7 +112,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
         backgroundColor: const Color(0xFF3A3A5A),
         bufferedColor: const Color(0xFF2AABEE).withOpacity(0.3),
       ),
-      overlay: overlay,
+      overlay: qualityLabel.isNotEmpty
+          ? Align(
+              alignment: Alignment.topRight,
+              child: Padding(
+                padding: const EdgeInsets.only(top: 12, right: 12),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.6),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    qualityLabel,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ),
+            )
+          : null,
     );
   }
 
@@ -149,23 +142,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final value = _videoController?.value;
     if (value == null) return;
     if (value.hasError && _initError == null && mounted) {
-      setState(() => _initError = value.errorDescription ?? 'Video error');
+      setState(
+          () => _initError = value.errorDescription ?? 'Unknown video error');
     }
   }
 
   Future<void> _initAudioPlayer() async {
     _audioPlayer = AudioPlayer();
-
     _subs.add(_audioPlayer!.durationStream.listen((d) {
       if (d != null && mounted) setState(() => _audioDuration = d);
     }));
     _subs.add(_audioPlayer!.positionStream.listen((p) {
       if (mounted) setState(() => _audioPosition = p);
     }));
-    _subs.add(_audioPlayer!.playingStream.listen((playing) {
-      if (mounted) setState(() => _isAudioPlaying = playing);
+    _subs.add(_audioPlayer!.playingStream.listen((v) {
+      if (mounted) setState(() => _isAudioPlaying = v);
     }));
-
     await _audioPlayer!.setUrl(widget.streamUrl);
     await _audioPlayer!.play();
   }
@@ -175,13 +167,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       s.cancel();
     }
     _subs.clear();
-
     _videoController?.removeListener(_onVideoError);
     _chewieController?.dispose();
     _chewieController = null;
     _videoController?.dispose();
     _videoController = null;
-
     _audioPlayer?.dispose();
     _audioPlayer = null;
   }
@@ -200,30 +190,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final showAppBar =
-        !widget.file.isVideo || _isInitializing || _initError != null;
-
+    final hideAppBar =
+        widget.file.isVideo && !_isInitializing && _initError == null;
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0F),
-      appBar: showAppBar ? _buildAppBar() : null,
+      appBar: hideAppBar ? null : _buildAppBar(),
       body: _buildBody(),
     );
   }
 
-  AppBar _buildAppBar() {
-    return AppBar(
-      backgroundColor: const Color(0xFF0A0A0F),
-      leading: IconButton(
-        icon: const Icon(Icons.arrow_back, color: Colors.white),
-        onPressed: () => Navigator.pop(context),
-      ),
-      title: Text(
-        widget.file.name,
-        style: const TextStyle(color: Colors.white, fontSize: 15),
-        overflow: TextOverflow.ellipsis,
-      ),
-    );
-  }
+  AppBar _buildAppBar() => AppBar(
+        backgroundColor: const Color(0xFF0A0A0F),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text(
+          widget.file.name,
+          style: const TextStyle(color: Colors.white, fontSize: 15),
+          overflow: TextOverflow.ellipsis,
+        ),
+      );
 
   Widget _buildBody() {
     if (_isInitializing) return _buildLoading();
@@ -233,35 +220,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return _buildDocumentView();
   }
 
-  Widget _buildLoading() {
-    return const Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          CircularProgressIndicator(color: Color(0xFF2AABEE), strokeWidth: 2),
-          SizedBox(height: 20),
-          Text(
-            'Connecting to stream...',
-            style: TextStyle(color: Color(0xFF9090B0), fontSize: 15),
-          ),
-        ],
-      ),
-    );
-  }
+  Widget _buildLoading() => const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(
+                color: Color(0xFF2AABEE), strokeWidth: 2),
+            SizedBox(height: 20),
+            Text('Connecting to stream...',
+                style: TextStyle(color: Color(0xFF9090B0), fontSize: 15)),
+          ],
+        ),
+      );
 
   // ── Video ──────────────────────────────────────────────────────────────────
 
   Widget _buildVideoView() {
     final ctrl = _chewieController;
     final val = _videoController?.value;
-    if (ctrl == null ||
-        val == null ||
-        !val.isInitialized ||
-        val.aspectRatio <= 0) {
+    if (ctrl == null || val == null || !val.isInitialized || val.aspectRatio <= 0) {
       return const Center(
-        child:
-            CircularProgressIndicator(color: Color(0xFF2AABEE), strokeWidth: 2),
-      );
+          child: CircularProgressIndicator(
+              color: Color(0xFF2AABEE), strokeWidth: 2));
     }
     return Stack(
       children: [
@@ -290,31 +270,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
         ),
-        // Stream URL chip — taps open bottom sheet
+        // External player button
         Positioned(
-          bottom: 8,
+          top: 8,
           right: 8,
           child: SafeArea(
             child: GestureDetector(
-              onTap: () => _showStreamUrlSheet(context),
+              onTap: () => _showExternalPlayerSheet(),
               child: Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.6),
+                  color: Colors.black.withOpacity(0.55),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: const Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.link_rounded,
+                    Icon(Icons.open_in_new_rounded,
                         color: Color(0xFF2AABEE), size: 14),
                     SizedBox(width: 4),
-                    Text(
-                      'Stream URL',
-                      style:
-                          TextStyle(color: Colors.white, fontSize: 11),
-                    ),
+                    Text('External',
+                        style:
+                            TextStyle(color: Colors.white, fontSize: 11)),
                   ],
                 ),
               ),
@@ -334,14 +312,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         : 0.0;
 
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(28),
+      padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const SizedBox(height: 40),
+          const SizedBox(height: 32),
           Container(
-            width: 200,
-            height: 200,
+            width: 180,
+            height: 180,
             decoration: BoxDecoration(
               gradient: const LinearGradient(
                 colors: [Color(0xFF9B59B6), Color(0xFF6C3483)],
@@ -351,49 +328,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
               borderRadius: BorderRadius.circular(24),
               boxShadow: [
                 BoxShadow(
-                  color: const Color(0xFF9B59B6).withOpacity(0.4),
-                  blurRadius: 40,
-                  spreadRadius: 4,
-                ),
+                    color: const Color(0xFF9B59B6).withOpacity(0.4),
+                    blurRadius: 40,
+                    spreadRadius: 4)
               ],
             ),
             child: const Icon(Icons.music_note_rounded,
-                color: Colors.white, size: 80),
-          ),
-          const SizedBox(height: 40),
-          Text(
-            widget.file.name,
-            style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w600),
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            widget.file.mimeType.toUpperCase().replaceAll('AUDIO/', ''),
-            style: const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
+                color: Colors.white, size: 72),
           ),
           const SizedBox(height: 32),
+          Text(widget.file.name,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis),
+          const SizedBox(height: 6),
+          Text(
+              widget.file.mimeType
+                  .toUpperCase()
+                  .replaceAll('AUDIO/', ''),
+              style:
+                  const TextStyle(color: Color(0xFF9090B0), fontSize: 13)),
+          const SizedBox(height: 28),
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
               activeTrackColor: const Color(0xFF9B59B6),
               inactiveTrackColor: const Color(0xFF3A3A5A),
               thumbColor: const Color(0xFF9B59B6),
               trackHeight: 4,
-              thumbShape:
-                  const RoundSliderThumbShape(enabledThumbRadius: 8),
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
             ),
             child: Slider(
               value: progress,
-              onChanged: (v) {
-                final pos = Duration(
-                    milliseconds:
-                        (v * _audioDuration.inMilliseconds).round());
-                _audioPlayer?.seek(pos);
-              },
+              onChanged: (v) => _audioPlayer?.seek(Duration(
+                  milliseconds: (v * _audioDuration.inMilliseconds).round())),
             ),
           ),
           Padding(
@@ -410,37 +381,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ],
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 20),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               IconButton(
-                iconSize: 32,
-                icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
+                iconSize: 30,
+                icon: const Icon(Icons.replay_10_rounded,
+                    color: Colors.white),
                 onPressed: () {
-                  final p =
-                      _audioPosition - const Duration(seconds: 10);
-                  _audioPlayer?.seek(
-                      p < Duration.zero ? Duration.zero : p);
+                  final p = _audioPosition - const Duration(seconds: 10);
+                  _audioPlayer
+                      ?.seek(p < Duration.zero ? Duration.zero : p);
                 },
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 12),
               GestureDetector(
                 onTap: () => _isAudioPlaying
                     ? _audioPlayer?.pause()
                     : _audioPlayer?.play(),
                 child: Container(
-                  width: 72,
-                  height: 72,
+                  width: 68,
+                  height: 68,
                   decoration: BoxDecoration(
                     color: const Color(0xFF9B59B6),
                     shape: BoxShape.circle,
                     boxShadow: [
                       BoxShadow(
-                        color: const Color(0xFF9B59B6).withOpacity(0.4),
-                        blurRadius: 20,
-                        spreadRadius: 4,
-                      ),
+                          color: const Color(0xFF9B59B6).withOpacity(0.4),
+                          blurRadius: 20,
+                          spreadRadius: 4)
                     ],
                   ),
                   child: Icon(
@@ -448,26 +418,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         ? Icons.pause_rounded
                         : Icons.play_arrow_rounded,
                     color: Colors.white,
-                    size: 40,
+                    size: 38,
                   ),
                 ),
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 12),
               IconButton(
-                iconSize: 32,
+                iconSize: 30,
                 icon: const Icon(Icons.forward_30_rounded,
                     color: Colors.white),
                 onPressed: () {
-                  final p =
-                      _audioPosition + const Duration(seconds: 30);
-                  _audioPlayer?.seek(
-                      p > _audioDuration ? _audioDuration : p);
+                  final p = _audioPosition + const Duration(seconds: 30);
+                  _audioPlayer
+                      ?.seek(p > _audioDuration ? _audioDuration : p);
                 },
               ),
             ],
           ),
-          const SizedBox(height: 32),
-          _buildStreamUrlSection(),
+          const SizedBox(height: 28),
+          _buildStreamUrlCard(),
+          const SizedBox(height: 12),
+          _buildExternalButtons(),
         ],
       ),
     );
@@ -477,45 +448,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Widget _buildDocumentView() {
     final mime = widget.file.mimeType.toLowerCase();
-
-    final IconData fileIcon;
-    final Color iconColor;
+    final IconData icon;
+    final Color color;
 
     if (mime.contains('pdf')) {
-      fileIcon = Icons.picture_as_pdf_rounded;
-      iconColor = const Color(0xFFE74C3C);
+      icon = Icons.picture_as_pdf_rounded;
+      color = const Color(0xFFE74C3C);
     } else if (mime.contains('zip') ||
         mime.contains('rar') ||
         mime.contains('7z') ||
         mime.contains('tar') ||
         mime.contains('gz')) {
-      fileIcon = Icons.folder_zip_rounded;
-      iconColor = const Color(0xFFF39C12);
+      icon = Icons.folder_zip_rounded;
+      color = const Color(0xFFF39C12);
     } else if (mime.contains('word') ||
         mime.contains('msword') ||
         mime.contains('document')) {
-      fileIcon = Icons.description_rounded;
-      iconColor = const Color(0xFF2980B9);
+      icon = Icons.description_rounded;
+      color = const Color(0xFF2980B9);
     } else if (mime.contains('sheet') ||
         mime.contains('excel') ||
         mime.contains('spreadsheet')) {
-      fileIcon = Icons.table_chart_rounded;
-      iconColor = const Color(0xFF27AE60);
-    } else if (mime.contains('presentation') ||
-        mime.contains('powerpoint')) {
-      fileIcon = Icons.slideshow_rounded;
-      iconColor = const Color(0xFFE67E22);
-    } else if (mime.contains('text') ||
-        mime.contains('json') ||
-        mime.contains('xml')) {
-      fileIcon = Icons.text_snippet_rounded;
-      iconColor = const Color(0xFF9090B0);
-    } else if (mime.contains('image')) {
-      fileIcon = Icons.image_rounded;
-      iconColor = const Color(0xFF9B59B6);
+      icon = Icons.table_chart_rounded;
+      color = const Color(0xFF27AE60);
+    } else if (mime.contains('presentation') || mime.contains('powerpoint')) {
+      icon = Icons.slideshow_rounded;
+      color = const Color(0xFFE67E22);
     } else {
-      fileIcon = Icons.insert_drive_file_rounded;
-      iconColor = const Color(0xFF27AE60);
+      icon = Icons.insert_drive_file_rounded;
+      color = const Color(0xFF27AE60);
     }
 
     return SingleChildScrollView(
@@ -525,25 +486,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
         children: [
           const SizedBox(height: 16),
           Container(
-            width: 100,
-            height: 100,
+            width: 96,
+            height: 96,
             decoration: BoxDecoration(
-              color: iconColor.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(24),
+              color: color.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(22),
             ),
-            child: Icon(fileIcon, color: iconColor, size: 52),
+            child: Icon(icon, color: color, size: 50),
           ),
-          const SizedBox(height: 20),
-          Text(
-            widget.file.name,
-            style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w600),
-            textAlign: TextAlign.center,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-          ),
+          const SizedBox(height: 18),
+          Text(widget.file.name,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis),
           const SizedBox(height: 10),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -553,195 +512,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
               _badge(widget.file.mimeType.split('/').last.toUpperCase()),
             ],
           ),
-          const SizedBox(height: 32),
-          _buildStreamUrlSection(),
-          const SizedBox(height: 20),
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: const Color(0xFF0F1020),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: const Color(0xFF2A2A40)),
-            ),
-            child: const Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(Icons.info_outline_rounded,
-                    color: Color(0xFF2AABEE), size: 16),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'The stream URL is a live HTTP link served from this device. '
-                    'Open it in a browser, VLC, MX Player, or any app that '
-                    'supports HTTP streaming.',
-                    style: TextStyle(
-                      color: Color(0xFF7070A0),
-                      fontSize: 12,
-                      height: 1.5,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+          const SizedBox(height: 28),
+          _buildStreamUrlCard(),
+          const SizedBox(height: 14),
+          _buildExternalButtons(),
+          const SizedBox(height: 16),
+          _buildInfoCard(
+              'The stream URL is served live from this device. '
+              'Open in a browser, VLC, MX Player, or any app that '
+              'supports HTTP streaming.'),
         ],
-      ),
-    );
-  }
-
-  // ── Shared stream URL section ──────────────────────────────────────────────
-
-  Widget _buildStreamUrlSection() {
-    return Column(
-      children: [
-        // URL display box
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: const Color(0xFF141420),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: const Color(0xFF2A2A40)),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Row(
-                children: [
-                  Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
-                  SizedBox(width: 6),
-                  Text(
-                    'Stream URL',
-                    style: TextStyle(
-                      color: Color(0xFF2AABEE),
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              SelectableText(
-                widget.streamUrl,
-                style: const TextStyle(
-                  color: Color(0xFF9090B0),
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  height: 1.4,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: widget.streamUrl));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: const Text('Stream URL copied!'),
-                      backgroundColor: const Color(0xFF27AE60),
-                      behavior: SnackBarBehavior.floating,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8)),
-                      duration: const Duration(seconds: 2),
-                    ),
-                  );
-                },
-                icon: const Icon(Icons.copy_rounded, size: 16),
-                label: const Text('Copy URL'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.white,
-                  side: const BorderSide(color: Color(0xFF3A3A5A)),
-                  padding: const EdgeInsets.symmetric(vertical: 13),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                ),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: _openInBrowser,
-                icon: const Icon(Icons.open_in_browser_rounded, size: 16),
-                label: const Text('Open in Browser'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2AABEE),
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 13),
-                  elevation: 0,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Future<void> _openInBrowser() async {
-    final uri = Uri.parse(widget.streamUrl);
-    try {
-      final launched =
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!launched && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text(
-                'Could not open browser. Copy the URL and paste it manually.'),
-            backgroundColor: const Color(0xFFCF6679),
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8)),
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error: $e'),
-            backgroundColor: const Color(0xFFCF6679),
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8)),
-          ),
-        );
-      }
-    }
-  }
-
-  void _showStreamUrlSheet(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF141420),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      isScrollControlled: true,
-      builder: (_) => Padding(
-        padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 36,
-              height: 4,
-              decoration: BoxDecoration(
-                color: const Color(0xFF3A3A5A),
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(height: 20),
-            _buildStreamUrlSection(),
-          ],
-        ),
       ),
     );
   }
@@ -752,27 +532,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(28),
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
         children: [
           const SizedBox(height: 40),
           const Icon(Icons.error_outline_rounded,
-              color: Color(0xFFCF6679), size: 64),
-          const SizedBox(height: 20),
+              color: Color(0xFFCF6679), size: 60),
+          const SizedBox(height: 16),
           const Text('Playback Error',
               style: TextStyle(
                   color: Colors.white,
                   fontSize: 20,
                   fontWeight: FontWeight.w600)),
           const SizedBox(height: 10),
-          Text(
-            _initError ?? 'Unknown error',
-            style: const TextStyle(
-                color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
-          // Stream URL shown even on error so user can try external player
-          _buildStreamUrlSection(),
+          Text(_initError ?? 'Unknown error',
+              style: const TextStyle(
+                  color: Color(0xFF9090B0), fontSize: 13, height: 1.5),
+              textAlign: TextAlign.center),
+          const SizedBox(height: 20),
+          _buildInfoCard(
+              'The built-in player failed. Try opening in VLC or MX Player '
+              'using the buttons below — they handle more formats.'),
+          const SizedBox(height: 16),
+          _buildStreamUrlCard(),
+          const SizedBox(height: 12),
+          _buildExternalButtons(),
           const SizedBox(height: 20),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -780,15 +562,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
               OutlinedButton(
                 onPressed: () => Navigator.pop(context),
                 style: OutlinedButton.styleFrom(
-                  side: const BorderSide(color: Color(0xFF3A3A5A)),
-                  foregroundColor: Colors.white,
-                ),
+                    side: const BorderSide(color: Color(0xFF3A3A5A)),
+                    foregroundColor: Colors.white),
                 child: const Text('Go Back'),
               ),
               const SizedBox(width: 12),
-              ElevatedButton(
+              ElevatedButton.icon(
                 onPressed: _initPlayer,
-                child: const Text('Retry'),
+                icon: const Icon(Icons.refresh_rounded, size: 16),
+                label: const Text('Retry'),
               ),
             ],
           ),
@@ -797,30 +579,291 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
+  // ── Stream URL card ────────────────────────────────────────────────────────
 
-  Widget _badge(String text) {
+  Widget _buildStreamUrlCard() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E35),
-        borderRadius: BorderRadius.circular(6),
+        color: const Color(0xFF141420),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF2A2A40)),
       ),
-      child: Text(
-        text,
-        style: const TextStyle(color: Color(0xFF9090B0), fontSize: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
+              SizedBox(width: 6),
+              Text('Stream URL',
+                  style: TextStyle(
+                    color: Color(0xFF2AABEE),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.5,
+                  )),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SelectableText(
+            widget.streamUrl,
+            style: const TextStyle(
+              color: Color(0xFF9090B0),
+              fontSize: 12,
+              fontFamily: 'monospace',
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: widget.streamUrl));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: const Text('Stream URL copied!'),
+                    backgroundColor: const Color(0xFF27AE60),
+                    behavior: SnackBarBehavior.floating,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8)),
+                    duration: const Duration(seconds: 2),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.copy_rounded, size: 15),
+              label: const Text('Copy URL'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.white,
+                side: const BorderSide(color: Color(0xFF3A3A5A)),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
+
+  // ── External player buttons ────────────────────────────────────────────────
+
+  Widget _buildExternalButtons() {
+    return Column(
+      children: [
+        // Open in browser
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: _openInBrowser,
+            icon: const Icon(Icons.open_in_browser_rounded, size: 17),
+            label: const Text('Open in Browser',
+                style: TextStyle(fontWeight: FontWeight.w600)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF2AABEE),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 13),
+              elevation: 0,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        // VLC
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () => _openInApp('vlc'),
+            icon: const Icon(Icons.play_circle_outline_rounded, size: 17),
+            label: const Text('Open in VLC',
+                style: TextStyle(fontWeight: FontWeight.w600)),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFFE67E22),
+              side: const BorderSide(color: Color(0xFFE67E22)),
+              padding: const EdgeInsets.symmetric(vertical: 13),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        // MX Player
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () => _openInApp('mx'),
+            icon: const Icon(Icons.smart_display_rounded, size: 17),
+            label: const Text('Open in MX Player',
+                style: TextStyle(fontWeight: FontWeight.w600)),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFF9B59B6),
+              side: const BorderSide(color: Color(0xFF9B59B6)),
+              padding: const EdgeInsets.symmetric(vertical: 13),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ── Open in external app ───────────────────────────────────────────────────
+  //
+  // Both VLC and MX Player respond to android.intent.action.VIEW with an HTTP
+  // URI and the correct MIME type. url_launcher handles this via
+  // LaunchMode.externalApplication which fires the Android intent chooser.
+  //
+  // VLC also supports its own vlc:// scheme as a fallback.
+
+  Future<void> _openInBrowser() async {
+    final uri = Uri.parse(widget.streamUrl);
+    try {
+      if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+        _showError('Could not open browser. Copy the URL manually.');
+      }
+    } catch (e) {
+      _showError('Error: $e');
+    }
+  }
+
+  Future<void> _openInApp(String app) async {
+    final mime = widget.file.mimeType.isNotEmpty
+        ? widget.file.mimeType
+        : 'video/*';
+
+    if (app == 'vlc') {
+      // Try VLC intent first, fall back to generic VIEW
+      final vlcUri = Uri.parse(
+          'vlc://${widget.streamUrl.replaceFirst('http://', '')}');
+      final httpUri = Uri.parse(widget.streamUrl);
+
+      bool launched = false;
+      try {
+        launched = await launchUrl(vlcUri,
+            mode: LaunchMode.externalApplication);
+      } catch (_) {}
+
+      if (!launched) {
+        try {
+          launched = await launchUrl(httpUri,
+              mode: LaunchMode.externalApplication);
+        } catch (_) {}
+      }
+
+      if (!launched && mounted) {
+        _showError('VLC not found. Install VLC and try again.');
+      }
+      return;
+    }
+
+    if (app == 'mx') {
+      // MX Player Pro uses com.mxtech.videoplayer.pro
+      // MX Player Free uses com.mxtech.videoplayer.ad
+      // Both respond to ACTION_VIEW with an HTTP URI
+      final uri = Uri.parse(widget.streamUrl);
+      try {
+        if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+          _showError('MX Player not found. Install MX Player and try again.');
+        }
+      } catch (e) {
+        _showError('Error: $e');
+      }
+      return;
+    }
+  }
+
+  void _showExternalPlayerSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141420),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      isScrollControlled: true,
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 36,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 20),
+              decoration: BoxDecoration(
+                color: const Color(0xFF3A3A5A),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            _buildStreamUrlCard(),
+            const SizedBox(height: 14),
+            _buildExternalButtons(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showError(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: const Color(0xFFCF6679),
+        behavior: SnackBarBehavior.floating,
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+    );
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  Widget _badge(String text) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E1E35),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(text,
+            style:
+                const TextStyle(color: Color(0xFF9090B0), fontSize: 12)),
+      );
+
+  Widget _buildInfoCard(String text) => Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0F1020),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF2A2A40)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.info_outline_rounded,
+                color: Color(0xFF2AABEE), size: 16),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(text,
+                  style: const TextStyle(
+                    color: Color(0xFF7070A0),
+                    fontSize: 12,
+                    height: 1.5,
+                  )),
+            ),
+          ],
+        ),
+      );
 
   String _fmt(Duration d) {
     final h = d.inHours;
     final m = d.inMinutes % 60;
     final s = d.inSeconds % 60;
     if (h > 0) {
-      return '${h.toString().padLeft(2, '0')}:'
-          '${m.toString().padLeft(2, '0')}:'
-          '${s.toString().padLeft(2, '0')}';
+      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
     }
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
