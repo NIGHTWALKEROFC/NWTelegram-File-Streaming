@@ -470,9 +470,7 @@ class TelegramService extends ChangeNotifier {
     );
   }
 
-  // FIX: Check mime type and file extension to detect real type.
-  // Telegram sends .mkv, .mp4, .avi etc. as messageDocument.
-  // Uses public static helpers TelegramFile.mimeIsVideo / mimeIsAudio.
+  // Detects real type from mime + extension for files sent as documents
   TelegramFile? _parseDocument(Map<String, dynamic> content) {
     final doc = content['document'] as Map<String, dynamic>?;
     final file = doc?['document'] as Map<String, dynamic>?;
@@ -482,7 +480,6 @@ class TelegramService extends ChangeNotifier {
     final mimeType =
         doc['mime_type'] as String? ?? 'application/octet-stream';
 
-    // Determine real type: mime first, then extension fallback
     TelegramFileType realType;
     if (TelegramFile.mimeIsVideo(mimeType)) {
       realType = TelegramFileType.video;
@@ -553,6 +550,14 @@ class TelegramService extends ChangeNotifier {
   }
 
   // ── Streaming ──────────────────────────────────────────────────────────────
+  //
+  // downloadFilePart: asks TDLib to download [offset, offset+count) of the
+  // file and reads those bytes from the local cache file.
+  //
+  // TDLib's downloadFile(synchronous:true) blocks until the requested prefix
+  // is available. We then read exactly the bytes we need from the local file.
+  // If downloaded_prefix_size < offset+count, we return what's available so
+  // the stream_service retry loop can request more.
 
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -560,36 +565,61 @@ class TelegramService extends ChangeNotifier {
     required int count,
   }) async {
     try {
-      final res = await _request({
-        '@type': 'downloadFile',
-        'file_id': fileId,
-        'priority': 32,
-        'offset': offset,
-        'limit': count,
-        'synchronous': true,
-      });
-      if (res == null || res['@type'] == 'error') return null;
+      // Step 1: Tell TDLib to download up to offset+count bytes synchronously
+      final res = await _request(
+        {
+          '@type': 'downloadFile',
+          'file_id': fileId,
+          'priority': 32,
+          'offset': offset,
+          'limit': count,
+          'synchronous': true,
+        },
+        timeout: const Duration(seconds: 60),
+      );
+
+      if (res == null || res['@type'] == 'error') {
+        debugPrint(
+            'downloadFilePart: TDLib error ${res?['message']} at offset=$offset');
+        return null;
+      }
 
       final local = res['local'] as Map<String, dynamic>?;
-      final path = local?['path'] as String?;
+      if (local == null) return null;
+
+      final isDownloading = local['is_downloading_active'] as bool? ?? false;
+      final prefixSize = local['downloaded_prefix_size'] as int? ?? 0;
+      final path = local['path'] as String?;
+
+      debugPrint(
+          'downloadFilePart: offset=$offset count=$count prefix=$prefixSize path=$path');
+
       if (path == null || path.isEmpty) return null;
 
-      final f = io.File(path);
-      if (!await f.exists()) return null;
+      final file = io.File(path);
+      if (!await file.exists()) return null;
 
-      final prefixSize = local?['downloaded_prefix_size'] as int? ?? 0;
+      // How many bytes are actually available starting from offset
       final available = (prefixSize - offset).clamp(0, count);
-      if (available <= 0) return Uint8List(0);
+      if (available <= 0) {
+        // TDLib hasn't buffered this range yet
+        if (isDownloading) {
+          // Return null so stream_service retries after a delay
+          return null;
+        }
+        return Uint8List(0); // EOF
+      }
 
-      final raf = await f.open();
+      // Step 2: Read the available bytes from the local file
+      final raf = await file.open();
       try {
         await raf.setPosition(offset);
         return await raf.read(available);
       } finally {
         await raf.close();
       }
-    } catch (e) {
-      debugPrint('downloadFilePart error: $e');
+    } catch (e, st) {
+      debugPrint('downloadFilePart error: $e\n$st');
       return null;
     }
   }
