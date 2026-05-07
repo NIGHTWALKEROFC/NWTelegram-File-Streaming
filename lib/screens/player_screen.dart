@@ -1,13 +1,34 @@
 // lib/screens/player_screen.dart
+//
+// REWRITE: Replaced video_player + chewie with media_kit (libmpv/FFmpeg).
+//
+// WHY:
+//   video_player uses Android's ExoPlayer with its default codec pipeline.
+//   ExoPlayer does NOT support:
+//     • HEVC / H.265 (software decode)
+//     • Many MKV/TS container variations
+//     • AV1 on older devices
+//     • Certain AAC/AC3/DTS audio tracks
+//   This caused the PlatformException(VideoError, ExoPlaybackException: Source error).
+//
+//   media_kit bundles its own FFmpeg (same library used by VLC and MPV) via
+//   media_kit_libs_android_video, so it decodes everything natively in-process
+//   without relying on the OS codec stack at all.
+//
+// CHANGES:
+//   • VideoPlayerController + ChewieController → media_kit Player + VideoController
+//   • Custom controls built with media_kit's StreamBuilders (play/pause, seek,
+//     speed, fullscreen, volume, brightness)
+//   • VLC / MX Player buttons removed — no longer needed
+//   • Audio playback unchanged (just_audio is fine for audio-only files)
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:video_player/video_player.dart';
-import 'package:chewie/chewie.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 
 import '../models/telegram_file.dart';
 
@@ -28,18 +49,20 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  VideoPlayerController? _videoController;
-  ChewieController? _chewieController;
+  // ── media_kit ──────────────────────────────────────────────────────────────
+  Player? _player;
+  VideoController? _videoController;
+
+  // ── just_audio (audio-only files) ─────────────────────────────────────────
   AudioPlayer? _audioPlayer;
-
-  bool _isInitializing = true;
-  String? _initError;
-
   bool _isAudioPlaying = false;
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
-
   final List<StreamSubscription<dynamic>> _subs = [];
+
+  // ── UI state ───────────────────────────────────────────────────────────────
+  bool _isInitializing = true;
+  String? _initError;
 
   @override
   void initState() {
@@ -50,6 +73,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       Future.delayed(const Duration(milliseconds: 300), _initPlayer);
     }
   }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
 
   Future<void> _initPlayer() async {
     if (!mounted) return;
@@ -80,71 +105,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _initVideoPlayer() async {
-    final uri = Uri.parse(widget.streamUrl);
-    _videoController = VideoPlayerController.networkUrl(
-      uri,
-      httpHeaders: const {'Accept': '*/*', 'Connection': 'keep-alive'},
-    );
-    _videoController!.addListener(_onVideoError);
-    await _videoController!.initialize();
-    if (!mounted) return;
-
-    final qualityLabel = widget.selectedQuality?.label ??
-        (widget.file.height > 0 ? '${widget.file.height}p' : '');
-
-    _chewieController = ChewieController(
-      videoPlayerController: _videoController!,
-      autoPlay: true,
-      looping: false,
-      allowFullScreen: true,
-      allowMuting: true,
-      showControlsOnInitialize: true,
-      allowPlaybackSpeedChanging: true,
-      playbackSpeeds: const [0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
-      deviceOrientationsAfterFullScreen: [DeviceOrientation.portraitUp],
-      deviceOrientationsOnEnterFullScreen: [
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ],
-      materialProgressColors: ChewieProgressColors(
-        playedColor: const Color(0xFF2AABEE),
-        handleColor: const Color(0xFF2AABEE),
-        backgroundColor: const Color(0xFF3A3A5A),
-        bufferedColor: const Color(0xFF2AABEE).withOpacity(0.3),
+    // Create a media_kit Player.
+    // configuration options: cache size, network timeout, etc.
+    _player = Player(
+      configuration: const PlayerConfiguration(
+        // Buffer 8 MB ahead — good balance between startup latency and
+        // continuous playback over the local proxy.
+        bufferSize: 8 * 1024 * 1024,
+        logLevel: MPVLogLevel.warn,
       ),
-      overlay: qualityLabel.isNotEmpty
-          ? Align(
-              alignment: Alignment.topRight,
-              child: Padding(
-                padding: const EdgeInsets.only(top: 12, right: 12),
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.6),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    qualityLabel,
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700),
-                  ),
-                ),
-              ),
-            )
-          : null,
     );
-  }
 
-  void _onVideoError() {
-    final value = _videoController?.value;
-    if (value == null) return;
-    if (value.hasError && _initError == null && mounted) {
-      setState(
-          () => _initError = value.errorDescription ?? 'Unknown video error');
-    }
+    _videoController = VideoController(_player!);
+
+    // Listen for player errors
+    _subs.add(_player!.stream.error.listen((err) {
+      debugPrint('media_kit error: $err');
+      if (mounted && _initError == null) {
+        setState(() => _initError = err);
+      }
+    }));
+
+    // Open the stream URL — media_kit passes this straight to FFmpeg/libmpv
+    // which handles HTTP range requests and all demuxing itself.
+    await _player!.open(
+      Media(
+        widget.streamUrl,
+        httpHeaders: const {
+          'Accept': '*/*',
+          'Connection': 'keep-alive',
+        },
+      ),
+    );
   }
 
   Future<void> _initAudioPlayer() async {
@@ -162,16 +154,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _audioPlayer!.play();
   }
 
+  // ── Dispose ────────────────────────────────────────────────────────────────
+
   void _disposeControllers() {
     for (final s in _subs) {
       s.cancel();
     }
     _subs.clear();
-    _videoController?.removeListener(_onVideoError);
-    _chewieController?.dispose();
-    _chewieController = null;
     _videoController?.dispose();
     _videoController = null;
+    _player?.dispose();
+    _player = null;
     _audioPlayer?.dispose();
     _audioPlayer = null;
   }
@@ -182,6 +175,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
     ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _disposeControllers();
     super.dispose();
   }
@@ -192,8 +186,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget build(BuildContext context) {
     final hideAppBar =
         widget.file.isVideo && !_isInitializing && _initError == null;
+
     return Scaffold(
-      backgroundColor: const Color(0xFF0A0A0F),
+      backgroundColor: Colors.black,
       appBar: hideAppBar ? null : _buildAppBar(),
       body: _buildBody(),
     );
@@ -233,77 +228,108 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
 
-  // ── Video ──────────────────────────────────────────────────────────────────
+  // ── Video view (media_kit) ─────────────────────────────────────────────────
+  //
+  // MaterialVideoControlsThemeData gives us a polished, customised control
+  // surface built on top of media_kit_video's built-in controls. This
+  // includes: play/pause, seek bar, volume, brightness, speed, fullscreen.
 
   Widget _buildVideoView() {
-    final ctrl = _chewieController;
-    final val = _videoController?.value;
-    if (ctrl == null || val == null || !val.isInitialized || val.aspectRatio <= 0) {
+    final ctrl = _videoController;
+    if (ctrl == null) {
       return const Center(
           child: CircularProgressIndicator(
               color: Color(0xFF2AABEE), strokeWidth: 2));
     }
-    return Stack(
-      children: [
-        Center(
-          child: AspectRatio(
-            aspectRatio: val.aspectRatio,
-            child: Chewie(controller: ctrl),
+
+    final qualityLabel = widget.selectedQuality?.label ??
+        (widget.file.height > 0 ? '${widget.file.height}p' : '');
+
+    return MaterialVideoControlsTheme(
+      normal: MaterialVideoControlsThemeData(
+        // Control bar colours
+        controlsHoverDuration: const Duration(seconds: 4),
+        seekBarColor: const Color(0xFF2AABEE),
+        seekBarPositionColor: const Color(0xFF2AABEE),
+        seekBarThumbColor: const Color(0xFF2AABEE),
+        seekBarBufferedColor: const Color(0xFF2AABEE).withOpacity(0.3),
+        primaryButtonBar: [
+          const Spacer(),
+          MaterialSkipPreviousButton(),
+          const Spacer(),
+          MaterialPlayOrPauseButton(iconSize: 48),
+          const Spacer(),
+          MaterialSkipNextButton(),
+          const Spacer(),
+        ],
+        topButtonBar: [
+          // Back button
+          MaterialDesktopCustomButton(
+            onPressed: () => Navigator.pop(context),
+            icon: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
           ),
-        ),
-        // Back button
-        Positioned(
-          top: 8,
-          left: 8,
-          child: SafeArea(
-            child: GestureDetector(
-              onTap: () => Navigator.pop(context),
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.5),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Icon(Icons.arrow_back,
-                    color: Colors.white, size: 20),
-              ),
-            ),
-          ),
-        ),
-        // External player button
-        Positioned(
-          top: 8,
-          right: 8,
-          child: SafeArea(
-            child: GestureDetector(
-              onTap: () => _showExternalPlayerSheet(),
+          const Spacer(),
+          // Quality badge
+          if (qualityLabel.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
               child: Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.55),
+                  color: Colors.black.withOpacity(0.6),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.open_in_new_rounded,
-                        color: Color(0xFF2AABEE), size: 14),
-                    SizedBox(width: 4),
-                    Text('External',
-                        style:
-                            TextStyle(color: Colors.white, fontSize: 11)),
-                  ],
+                child: Text(
+                  qualityLabel,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700),
                 ),
               ),
             ),
-          ),
-        ),
-      ],
+        ],
+        bottomButtonBar: [
+          const MaterialPositionIndicator(),
+          const Spacer(),
+          MaterialSpeedButton(),
+          MaterialFullscreenButton(),
+        ],
+        volumeGesture: true,
+        brightnessGesture: true,
+        seekGesture: true,
+      ),
+      fullscreen: const MaterialVideoControlsThemeData(
+        volumeGesture: true,
+        brightnessGesture: true,
+        seekGesture: true,
+      ),
+      child: Video(
+        controller: ctrl,
+        // Fill the screen; media_kit letterboxes automatically
+        fit: BoxFit.contain,
+        onEnterFullscreen: () async {
+          await SystemChrome.setPreferredOrientations([
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]);
+          await SystemChrome.setEnabledSystemUIMode(
+              SystemUiMode.immersiveSticky);
+        },
+        onExitFullscreen: () async {
+          await SystemChrome.setPreferredOrientations([
+            DeviceOrientation.portraitUp,
+            DeviceOrientation.portraitDown,
+          ]);
+          await SystemChrome.setEnabledSystemUIMode(
+              SystemUiMode.edgeToEdge);
+        },
+      ),
     );
   }
 
-  // ── Audio ──────────────────────────────────────────────────────────────────
+  // ── Audio view ─────────────────────────────────────────────────────────────
 
   Widget _buildAudioView() {
     final progress = _audioDuration.inMilliseconds > 0
@@ -364,7 +390,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Slider(
               value: progress,
               onChanged: (v) => _audioPlayer?.seek(Duration(
-                  milliseconds: (v * _audioDuration.inMilliseconds).round())),
+                  milliseconds:
+                      (v * _audioDuration.inMilliseconds).round())),
             ),
           ),
           Padding(
@@ -437,14 +464,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
           const SizedBox(height: 28),
           _buildStreamUrlCard(),
-          const SizedBox(height: 12),
-          _buildExternalButtons(),
         ],
       ),
     );
   }
 
-  // ── Document ───────────────────────────────────────────────────────────────
+  // ── Document view ──────────────────────────────────────────────────────────
 
   Widget _buildDocumentView() {
     final mime = widget.file.mimeType.toLowerCase();
@@ -471,7 +496,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         mime.contains('spreadsheet')) {
       icon = Icons.table_chart_rounded;
       color = const Color(0xFF27AE60);
-    } else if (mime.contains('presentation') || mime.contains('powerpoint')) {
+    } else if (mime.contains('presentation') ||
+        mime.contains('powerpoint')) {
       icon = Icons.slideshow_rounded;
       color = const Color(0xFFE67E22);
     } else {
@@ -514,13 +540,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
           const SizedBox(height: 28),
           _buildStreamUrlCard(),
-          const SizedBox(height: 14),
-          _buildExternalButtons(),
           const SizedBox(height: 16),
           _buildInfoCard(
               'The stream URL is served live from this device. '
-              'Open in a browser, VLC, MX Player, or any app that '
-              'supports HTTP streaming.'),
+              'Copy it and open it in any app that supports HTTP streaming.'),
         ],
       ),
     );
@@ -548,13 +571,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   color: Color(0xFF9090B0), fontSize: 13, height: 1.5),
               textAlign: TextAlign.center),
           const SizedBox(height: 20),
-          _buildInfoCard(
-              'The built-in player failed. Try opening in VLC or MX Player '
-              'using the buttons below — they handle more formats.'),
-          const SizedBox(height: 16),
           _buildStreamUrlCard(),
-          const SizedBox(height: 12),
-          _buildExternalButtons(),
           const SizedBox(height: 20),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -645,177 +662,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  // ── External player buttons ────────────────────────────────────────────────
-
-  Widget _buildExternalButtons() {
-    return Column(
-      children: [
-        // Open in browser
-        SizedBox(
-          width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: _openInBrowser,
-            icon: const Icon(Icons.open_in_browser_rounded, size: 17),
-            label: const Text('Open in Browser',
-                style: TextStyle(fontWeight: FontWeight.w600)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF2AABEE),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 13),
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
-        // VLC
-        SizedBox(
-          width: double.infinity,
-          child: OutlinedButton.icon(
-            onPressed: () => _openInApp('vlc'),
-            icon: const Icon(Icons.play_circle_outline_rounded, size: 17),
-            label: const Text('Open in VLC',
-                style: TextStyle(fontWeight: FontWeight.w600)),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: const Color(0xFFE67E22),
-              side: const BorderSide(color: Color(0xFFE67E22)),
-              padding: const EdgeInsets.symmetric(vertical: 13),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
-        // MX Player
-        SizedBox(
-          width: double.infinity,
-          child: OutlinedButton.icon(
-            onPressed: () => _openInApp('mx'),
-            icon: const Icon(Icons.smart_display_rounded, size: 17),
-            label: const Text('Open in MX Player',
-                style: TextStyle(fontWeight: FontWeight.w600)),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: const Color(0xFF9B59B6),
-              side: const BorderSide(color: Color(0xFF9B59B6)),
-              padding: const EdgeInsets.symmetric(vertical: 13),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  // ── Open in external app ───────────────────────────────────────────────────
-  //
-  // Both VLC and MX Player respond to android.intent.action.VIEW with an HTTP
-  // URI and the correct MIME type. url_launcher handles this via
-  // LaunchMode.externalApplication which fires the Android intent chooser.
-  //
-  // VLC also supports its own vlc:// scheme as a fallback.
-
-  Future<void> _openInBrowser() async {
-    final uri = Uri.parse(widget.streamUrl);
-    try {
-      if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-        _showError('Could not open browser. Copy the URL manually.');
-      }
-    } catch (e) {
-      _showError('Error: $e');
-    }
-  }
-
-  Future<void> _openInApp(String app) async {
-    final mime = widget.file.mimeType.isNotEmpty
-        ? widget.file.mimeType
-        : 'video/*';
-
-    if (app == 'vlc') {
-      // Try VLC intent first, fall back to generic VIEW
-      final vlcUri = Uri.parse(
-          'vlc://${widget.streamUrl.replaceFirst('http://', '')}');
-      final httpUri = Uri.parse(widget.streamUrl);
-
-      bool launched = false;
-      try {
-        launched = await launchUrl(vlcUri,
-            mode: LaunchMode.externalApplication);
-      } catch (_) {}
-
-      if (!launched) {
-        try {
-          launched = await launchUrl(httpUri,
-              mode: LaunchMode.externalApplication);
-        } catch (_) {}
-      }
-
-      if (!launched && mounted) {
-        _showError('VLC not found. Install VLC and try again.');
-      }
-      return;
-    }
-
-    if (app == 'mx') {
-      // MX Player Pro uses com.mxtech.videoplayer.pro
-      // MX Player Free uses com.mxtech.videoplayer.ad
-      // Both respond to ACTION_VIEW with an HTTP URI
-      final uri = Uri.parse(widget.streamUrl);
-      try {
-        if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-          _showError('MX Player not found. Install MX Player and try again.');
-        }
-      } catch (e) {
-        _showError('Error: $e');
-      }
-      return;
-    }
-  }
-
-  void _showExternalPlayerSheet() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF141420),
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      isScrollControlled: true,
-      builder: (_) => Padding(
-        padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 36,
-              height: 4,
-              margin: const EdgeInsets.only(bottom: 20),
-              decoration: BoxDecoration(
-                color: const Color(0xFF3A3A5A),
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            _buildStreamUrlCard(),
-            const SizedBox(height: 14),
-            _buildExternalButtons(),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _showError(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: const Color(0xFFCF6679),
-        behavior: SnackBarBehavior.floating,
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
     );
   }
