@@ -1,26 +1,25 @@
 // lib/screens/player_screen.dart
 //
-// REWRITE: Replaced video_player + chewie with media_kit (libmpv/FFmpeg).
+// FIXES in this revision:
+// ========================
+// 1. Player + VideoController are created SYNCHRONOUSLY in initState.
+//    media_kit requires the VideoController to exist before the Video widget
+//    is first built so the native surface (SurfaceTexture on Android) is
+//    registered before libmpv tries to attach to it. Creating them inside an
+//    async function that runs after a delay means the surface may not exist
+//    when libmpv starts — resulting in a black screen / no controls.
 //
-// WHY:
-//   video_player uses Android's ExoPlayer with its default codec pipeline.
-//   ExoPlayer does NOT support:
-//     • HEVC / H.265 (software decode)
-//     • Many MKV/TS container variations
-//     • AV1 on older devices
-//     • Certain AAC/AC3/DTS audio tracks
-//   This caused the PlatformException(VideoError, ExoPlaybackException: Source error).
+// 2. player.open() is called via addPostFrameCallback AFTER the first frame
+//    is drawn. This guarantees the Video widget's Texture is registered and
+//    the local proxy server (started in HomeScreen.initState) has had time to
+//    bind its port before libmpv makes its first HTTP request to 127.0.0.1.
 //
-//   media_kit bundles its own FFmpeg (same library used by VLC and MPV) via
-//   media_kit_libs_android_video, so it decodes everything natively in-process
-//   without relying on the OS codec stack at all.
+// 3. _isInitializing gate removed for video. The Video widget renders its own
+//    buffering spinner internally. Gating on _isInitializing meant the Video
+//    widget was never in the tree, so no surface existed for libmpv to render
+//    to and no controls were ever shown.
 //
-// CHANGES:
-//   • VideoPlayerController + ChewieController → media_kit Player + VideoController
-//   • Custom controls built with media_kit's StreamBuilders (play/pause, seek,
-//     speed, fullscreen, volume, brightness)
-//   • VLC / MX Player buttons removed — no longer needed
-//   • Audio playback unchanged (just_audio is fine for audio-only files)
+// 4. Error detection uses player.stream.error (string stream from libmpv).
 
 import 'dart:async';
 
@@ -49,126 +48,116 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // ── media_kit ──────────────────────────────────────────────────────────────
-  Player? _player;
-  VideoController? _videoController;
+  // ── media_kit — created synchronously in initState ─────────────────────────
+  late final Player _player;
+  late final VideoController _videoController;
 
   // ── just_audio (audio-only files) ─────────────────────────────────────────
   AudioPlayer? _audioPlayer;
   bool _isAudioPlaying = false;
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
+
   final List<StreamSubscription<dynamic>> _subs = [];
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  bool _isInitializing = true;
+  bool _isAudioInitializing = true;
   String? _initError;
 
   @override
   void initState() {
     super.initState();
-    if (widget.file.isDocument) {
-      setState(() => _isInitializing = false);
+
+    if (widget.file.isVideo) {
+      // Create Player + VideoController synchronously so the Video widget has
+      // a valid controller on its very first build. The native surface
+      // (SurfaceTexture) is registered here — deferring this means libmpv
+      // has nothing to render to.
+      _player = Player(
+        configuration: const PlayerConfiguration(
+          bufferSize: 8 * 1024 * 1024,
+          logLevel: MPVLogLevel.warn,
+        ),
+      );
+      _videoController = VideoController(_player);
+
+      _subs.add(_player.stream.error.listen((err) {
+        debugPrint('media_kit error: $err');
+        if (mounted && _initError == null && err.isNotEmpty) {
+          setState(() => _initError = err);
+        }
+      }));
+
+      // Open media AFTER first frame — by then the Texture is registered
+      // and the local proxy server has finished binding port 8484.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _player.open(
+          Media(
+            widget.streamUrl,
+            httpHeaders: const {
+              'Accept': '*/*',
+              'Connection': 'keep-alive',
+            },
+          ),
+        );
+      });
+    } else if (widget.file.isAudio) {
+      _player = Player();
+      _videoController = VideoController(_player);
+      Future.delayed(const Duration(milliseconds: 200), _initAudioPlayer);
     } else {
-      Future.delayed(const Duration(milliseconds: 300), _initPlayer);
+      _player = Player();
+      _videoController = VideoController(_player);
+      _isAudioInitializing = false;
     }
   }
 
-  // ── Init ───────────────────────────────────────────────────────────────────
-
-  Future<void> _initPlayer() async {
-    if (!mounted) return;
-    setState(() {
-      _isInitializing = true;
-      _initError = null;
-    });
-    _disposeControllers();
-
-    try {
-      if (widget.file.isVideo) {
-        await _initVideoPlayer();
-      } else if (widget.file.isAudio) {
-        await _initAudioPlayer();
-      }
-    } catch (e) {
-      debugPrint('PlayerScreen init error: $e');
-      if (mounted) {
-        setState(() {
-          _isInitializing = false;
-          _initError = e.toString();
-        });
-      }
-      return;
-    }
-
-    if (mounted) setState(() => _isInitializing = false);
-  }
-
-  Future<void> _initVideoPlayer() async {
-    // Create a media_kit Player.
-    // configuration options: cache size, network timeout, etc.
-    _player = Player(
-      configuration: const PlayerConfiguration(
-        // Buffer 8 MB ahead — good balance between startup latency and
-        // continuous playback over the local proxy.
-        bufferSize: 8 * 1024 * 1024,
-        logLevel: MPVLogLevel.warn,
-      ),
-    );
-
-    _videoController = VideoController(_player!);
-
-    // Listen for player errors
-    _subs.add(_player!.stream.error.listen((err) {
-      debugPrint('media_kit error: $err');
-      if (mounted && _initError == null) {
-        setState(() => _initError = err);
-      }
-    }));
-
-    // Open the stream URL — media_kit passes this straight to FFmpeg/libmpv
-    // which handles HTTP range requests and all demuxing itself.
-    await _player!.open(
-      Media(
-        widget.streamUrl,
-        httpHeaders: const {
-          'Accept': '*/*',
-          'Connection': 'keep-alive',
-        },
-      ),
-    );
-  }
+  // ── Audio init ─────────────────────────────────────────────────────────────
 
   Future<void> _initAudioPlayer() async {
-    _audioPlayer = AudioPlayer();
-    _subs.add(_audioPlayer!.durationStream.listen((d) {
-      if (d != null && mounted) setState(() => _audioDuration = d);
-    }));
-    _subs.add(_audioPlayer!.positionStream.listen((p) {
-      if (mounted) setState(() => _audioPosition = p);
-    }));
-    _subs.add(_audioPlayer!.playingStream.listen((v) {
-      if (mounted) setState(() => _isAudioPlaying = v);
-    }));
-    await _audioPlayer!.setUrl(widget.streamUrl);
-    await _audioPlayer!.play();
+    if (!mounted) return;
+    try {
+      _audioPlayer = AudioPlayer();
+      _subs.add(_audioPlayer!.durationStream.listen((d) {
+        if (d != null && mounted) setState(() => _audioDuration = d);
+      }));
+      _subs.add(_audioPlayer!.positionStream.listen((p) {
+        if (mounted) setState(() => _audioPosition = p);
+      }));
+      _subs.add(_audioPlayer!.playingStream.listen((v) {
+        if (mounted) setState(() => _isAudioPlaying = v);
+      }));
+      await _audioPlayer!.setUrl(widget.streamUrl);
+      await _audioPlayer!.play();
+    } catch (e) {
+      debugPrint('Audio init error: $e');
+      if (mounted) setState(() => _initError = e.toString());
+    } finally {
+      if (mounted) setState(() => _isAudioInitializing = false);
+    }
+  }
+
+  // ── Retry video ────────────────────────────────────────────────────────────
+
+  void _retryVideo() {
+    if (!mounted) return;
+    setState(() => _initError = null);
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (!mounted) return;
+      _player.open(
+        Media(
+          widget.streamUrl,
+          httpHeaders: const {
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
+          },
+        ),
+      );
+    });
   }
 
   // ── Dispose ────────────────────────────────────────────────────────────────
-
-  void _disposeControllers() {
-    for (final s in _subs) {
-      s.cancel();
-    }
-    _subs.clear();
-    // VideoController does NOT have a dispose() method in media_kit.
-    // Only Player needs to be disposed — it cleans up the controller too.
-    _videoController = null;
-    _player?.dispose();
-    _player = null;
-    _audioPlayer?.dispose();
-    _audioPlayer = null;
-  }
 
   @override
   void dispose() {
@@ -177,7 +166,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       DeviceOrientation.portraitDown,
     ]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    _disposeControllers();
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _subs.clear();
+    // VideoController has no dispose() — Player.dispose() cleans it up.
+    _player.dispose();
+    _audioPlayer?.dispose();
     super.dispose();
   }
 
@@ -185,13 +180,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final hideAppBar =
-        widget.file.isVideo && !_isInitializing && _initError == null;
+    if (_initError != null && widget.file.isVideo) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF0A0A0F),
+        appBar: _buildAppBar(),
+        body: _buildErrorView(),
+      );
+    }
+
+    if (widget.file.isVideo) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: _buildVideoView(),
+      );
+    }
 
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: hideAppBar ? null : _buildAppBar(),
-      body: _buildBody(),
+      backgroundColor: const Color(0xFF0A0A0F),
+      appBar: _buildAppBar(),
+      body: widget.file.isAudio
+          ? (_isAudioInitializing ? _buildLoading() : _buildAudioView())
+          : _buildDocumentView(),
     );
   }
 
@@ -208,14 +217,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
 
-  Widget _buildBody() {
-    if (_isInitializing) return _buildLoading();
-    if (_initError != null) return _buildErrorView();
-    if (widget.file.isVideo) return _buildVideoView();
-    if (widget.file.isAudio) return _buildAudioView();
-    return _buildDocumentView();
-  }
-
   Widget _buildLoading() => const Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -229,26 +230,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
 
-  // ── Video view (media_kit) ─────────────────────────────────────────────────
-  //
-  // MaterialVideoControlsThemeData gives us a polished, customised control
-  // surface built on top of media_kit_video's built-in controls. This
-  // includes: play/pause, seek bar, volume, brightness, speed, fullscreen.
+  // ── Video view ─────────────────────────────────────────────────────────────
 
   Widget _buildVideoView() {
-    final ctrl = _videoController;
-    if (ctrl == null) {
-      return const Center(
-          child: CircularProgressIndicator(
-              color: Color(0xFF2AABEE), strokeWidth: 2));
-    }
-
     final qualityLabel = widget.selectedQuality?.label ??
         (widget.file.height > 0 ? '${widget.file.height}p' : '');
 
     return MaterialVideoControlsTheme(
       normal: MaterialVideoControlsThemeData(
-        // Control bar colours
         controlsHoverDuration: const Duration(seconds: 4),
         seekBarColor: const Color(0xFF3A3A5A),
         seekBarPositionColor: const Color(0xFF2AABEE),
@@ -259,7 +248,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
           const Spacer(),
         ],
         topButtonBar: [
-          // Back button — plain widget, works on all platforms
           GestureDetector(
             onTap: () => Navigator.pop(context),
             child: Container(
@@ -274,7 +262,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
           const Spacer(),
-          // Quality badge
           if (qualityLabel.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(right: 8),
@@ -298,10 +285,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         bottomButtonBar: [
           const MaterialPositionIndicator(),
           const Spacer(),
-          // Speed picker — MaterialCustomButton is the correct API for custom
-          // buttons in mobile controls. MaterialSpeedButton does not exist.
           MaterialCustomButton(
-            onPressed: () => _showSpeedPicker(),
+            onPressed: _showSpeedPicker,
             icon: const Icon(Icons.speed_rounded, color: Colors.white),
           ),
           MaterialFullscreenButton(),
@@ -316,8 +301,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         seekGesture: true,
       ),
       child: Video(
-        controller: ctrl,
-        // Fill the screen; media_kit letterboxes automatically
+        controller: _videoController,
         fit: BoxFit.contain,
         onEnterFullscreen: () async {
           await SystemChrome.setPreferredOrientations([
@@ -374,7 +358,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       fontSize: 15)),
             ),
             StreamBuilder<double>(
-              stream: _player?.stream.rate,
+              stream: _player.stream.rate,
               initialData: 1.0,
               builder: (ctx, snap) {
                 final current = snap.data ?? 1.0;
@@ -385,7 +369,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     final selected = (s - current).abs() < 0.01;
                     return GestureDetector(
                       onTap: () {
-                        _player?.setRate(s);
+                        _player.setRate(s);
                         Navigator.pop(ctx);
                       },
                       child: Container(
@@ -465,11 +449,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
               overflow: TextOverflow.ellipsis),
           const SizedBox(height: 6),
           Text(
-              widget.file.mimeType
-                  .toUpperCase()
-                  .replaceAll('AUDIO/', ''),
-              style:
-                  const TextStyle(color: Color(0xFF9090B0), fontSize: 13)),
+              widget.file.mimeType.toUpperCase().replaceAll('AUDIO/', ''),
+              style: const TextStyle(
+                  color: Color(0xFF9090B0), fontSize: 13)),
           const SizedBox(height: 28),
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
@@ -477,7 +459,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
               inactiveTrackColor: const Color(0xFF3A3A5A),
               thumbColor: const Color(0xFF9B59B6),
               trackHeight: 4,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+              thumbShape:
+                  const RoundSliderThumbShape(enabledThumbRadius: 7),
             ),
             child: Slider(
               value: progress,
@@ -635,7 +618,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           const SizedBox(height: 16),
           _buildInfoCard(
               'The stream URL is served live from this device. '
-              'Copy it and open it in any app that supports HTTP streaming.'),
+              'Copy it and open in any app that supports HTTP streaming.'),
         ],
       ),
     );
@@ -677,7 +660,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
               const SizedBox(width: 12),
               ElevatedButton.icon(
-                onPressed: _initPlayer,
+                onPressed: _retryVideo,
                 icon: const Icon(Icons.refresh_rounded, size: 16),
                 label: const Text('Retry'),
               ),
@@ -767,8 +750,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
           borderRadius: BorderRadius.circular(6),
         ),
         child: Text(text,
-            style:
-                const TextStyle(color: Color(0xFF9090B0), fontSize: 12)),
+            style: const TextStyle(
+                color: Color(0xFF9090B0), fontSize: 12)),
       );
 
   Widget _buildInfoCard(String text) => Container(
