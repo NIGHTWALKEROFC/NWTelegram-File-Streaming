@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+// lib/models/telegram_file.dart
 
 enum TelegramFileType { video, audio, document, image, unknown }
 
@@ -35,7 +35,7 @@ class TelegramFile {
   final TelegramFileType type;
   final String name;
   final String mimeType;
-  final int duration; // seconds
+  final int duration;
   final int width;
   final int height;
   final int fileId;
@@ -57,6 +57,41 @@ class TelegramFile {
     this.thumbnail,
     required this.qualities,
   });
+
+  // ── Smart type detection from mime type ─────────────────────────────────────
+  // Telegram sends .mkv, .mp4, .avi etc. as messageDocument with a mime type.
+  // We detect what they really are so the right player is used.
+
+  /// Returns true if this file should be played as video
+  /// (either natively typed as video, or a document with a video mime type)
+  bool get isVideo {
+    if (type == TelegramFileType.video) return true;
+    if (type == TelegramFileType.document) return _mimeIsVideo(mimeType);
+    return false;
+  }
+
+  /// Returns true if this file should be played as audio
+  bool get isAudio {
+    if (type == TelegramFileType.audio) return true;
+    if (type == TelegramFileType.document) return _mimeIsAudio(mimeType);
+    return false;
+  }
+
+  /// Returns true only for non-playable documents (PDFs, ZIPs, etc.)
+  bool get isDocument => !isVideo && !isAudio;
+
+  bool get hasMultipleQualities => qualities.length > 1;
+
+  VideoQuality? get bestQuality =>
+      qualities.isNotEmpty ? qualities.first : null;
+
+  VideoQuality? qualityByLabel(String label) {
+    try {
+      return qualities.firstWhere((q) => q.label == label);
+    } catch (_) {
+      return null;
+    }
+  }
 
   String get readableSize {
     if (fileSize <= 0) return 'Unknown size';
@@ -80,20 +115,50 @@ class TelegramFile {
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
-  bool get isVideo => type == TelegramFileType.video;
-  bool get isAudio => type == TelegramFileType.audio;
-  bool get isDocument => type == TelegramFileType.document;
+  // ── Mime helpers ────────────────────────────────────────────────────────────
 
-  bool get hasMultipleQualities => qualities.length > 1;
+  static bool _mimeIsVideo(String mime) {
+    final m = mime.toLowerCase();
+    if (m.startsWith('video/')) return true;
+    // Common video mime types sometimes sent without video/ prefix
+    const videoTypes = {
+      'application/x-matroska', // .mkv
+      'application/mkv',
+      'application/mp4',
+      'application/x-mp4',
+      'application/mpeg',
+      'application/x-mpeg',
+      'application/ogg',
+    };
+    return videoTypes.contains(m);
+  }
 
-  VideoQuality? get bestQuality =>
-      qualities.isNotEmpty ? qualities.first : null;
+  static bool _mimeIsAudio(String mime) {
+    final m = mime.toLowerCase();
+    if (m.startsWith('audio/')) return true;
+    const audioTypes = {
+      'application/ogg',
+      'application/x-ogg',
+      'application/flac',
+      'application/x-flac',
+    };
+    return audioTypes.contains(m);
+  }
 
-  VideoQuality? qualityByLabel(String label) {
-    try {
-      return qualities.firstWhere((q) => q.label == label);
-    } catch (_) {
-      return null;
-    }
+  /// Detect type purely from file extension when mime type is ambiguous
+  static TelegramFileType typeFromExtension(String filename) {
+    final ext = filename.toLowerCase().split('.').last;
+    const videoExts = {
+      'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'mpeg', 'mpg',
+      'm4v', 'ts', '3gp', 'ogv', 'rm', 'rmvb', 'divx', 'xvid', 'hevc',
+      'h264', 'h265',
+    };
+    const audioExts = {
+      'mp3', 'aac', 'ogg', 'flac', 'wav', 'm4a', 'opus', 'wma', 'aiff',
+      'alac', 'ape', 'mka',
+    };
+    if (videoExts.contains(ext)) return TelegramFileType.video;
+    if (audioExts.contains(ext)) return TelegramFileType.audio;
+    return TelegramFileType.document;
   }
 }
