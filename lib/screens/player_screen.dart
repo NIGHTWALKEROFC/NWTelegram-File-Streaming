@@ -44,8 +44,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
-    // Documents skip player init — show UI immediately
     if (widget.file.isDocument) {
+      // Documents need no player — show UI immediately
       setState(() => _isInitializing = false);
     } else {
       Future.delayed(const Duration(milliseconds: 400), _initPlayer);
@@ -200,7 +200,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Video in fullscreen mode has no AppBar — everything else does
     final showAppBar =
         !widget.file.isVideo || _isInitializing || _initError != null;
 
@@ -250,7 +249,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Video view ─────────────────────────────────────────────────────────────
+  // ── Video ──────────────────────────────────────────────────────────────────
 
   Widget _buildVideoView() {
     final ctrl = _chewieController;
@@ -272,6 +271,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Chewie(controller: ctrl),
           ),
         ),
+        // Back button
         Positioned(
           top: 8,
           left: 8,
@@ -284,12 +284,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   color: Colors.black.withOpacity(0.5),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
+                child: const Icon(Icons.arrow_back,
+                    color: Colors.white, size: 20),
               ),
             ),
           ),
         ),
-        // Stream URL chip in the corner — always visible in video view
+        // Stream URL chip — taps open bottom sheet
         Positioned(
           bottom: 8,
           right: 8,
@@ -306,11 +307,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 child: const Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
+                    Icon(Icons.link_rounded,
+                        color: Color(0xFF2AABEE), size: 14),
                     SizedBox(width: 4),
                     Text(
                       'Stream URL',
-                      style: TextStyle(color: Colors.white, fontSize: 11),
+                      style:
+                          TextStyle(color: Colors.white, fontSize: 11),
                     ),
                   ],
                 ),
@@ -322,7 +325,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Audio view ─────────────────────────────────────────────────────────────
+  // ── Audio ──────────────────────────────────────────────────────────────────
 
   Widget _buildAudioView() {
     final progress = _audioDuration.inMilliseconds > 0
@@ -330,12 +333,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
             .clamp(0.0, 1.0)
         : 0.0;
 
-    return Container(
-      color: const Color(0xFF0A0A0F),
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(28),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
+          const SizedBox(height: 40),
           Container(
             width: 200,
             height: 200,
@@ -361,7 +364,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Text(
             widget.file.name,
             style: const TextStyle(
-                color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w600),
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
@@ -378,7 +383,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
               inactiveTrackColor: const Color(0xFF3A3A5A),
               thumbColor: const Color(0xFF9B59B6),
               trackHeight: 4,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+              thumbShape:
+                  const RoundSliderThumbShape(enabledThumbRadius: 8),
             ),
             child: Slider(
               value: progress,
@@ -412,8 +418,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 iconSize: 32,
                 icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
                 onPressed: () {
-                  final p = _audioPosition - const Duration(seconds: 10);
-                  _audioPlayer?.seek(p < Duration.zero ? Duration.zero : p);
+                  final p =
+                      _audioPosition - const Duration(seconds: 10);
+                  _audioPlayer?.seek(
+                      p < Duration.zero ? Duration.zero : p);
                 },
               ),
               const SizedBox(width: 16),
@@ -447,28 +455,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
               const SizedBox(width: 16),
               IconButton(
                 iconSize: 32,
-                icon: const Icon(Icons.forward_30_rounded, color: Colors.white),
+                icon: const Icon(Icons.forward_30_rounded,
+                    color: Colors.white),
                 onPressed: () {
-                  final p = _audioPosition + const Duration(seconds: 30);
-                  _audioPlayer
-                      ?.seek(p > _audioDuration ? _audioDuration : p);
+                  final p =
+                      _audioPosition + const Duration(seconds: 30);
+                  _audioPlayer?.seek(
+                      p > _audioDuration ? _audioDuration : p);
                 },
               ),
             ],
           ),
           const SizedBox(height: 32),
-          // Stream URL section for audio too
-          _buildStreamUrlRow(),
+          _buildStreamUrlSection(),
         ],
       ),
     );
   }
 
-  // ── Document view ──────────────────────────────────────────────────────────
-  // For truly non-playable files (PDFs, ZIPs, etc.)
-  // Shows the stream URL so user can copy it or open in browser.
-  // By the time we reach here, isVideo/isAudio are already false
-  // (handled correctly by TelegramFile's mime+extension detection).
+  // ── Document ───────────────────────────────────────────────────────────────
 
   Widget _buildDocumentView() {
     final mime = widget.file.mimeType.toLowerCase();
@@ -496,7 +501,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         mime.contains('spreadsheet')) {
       fileIcon = Icons.table_chart_rounded;
       iconColor = const Color(0xFF27AE60);
-    } else if (mime.contains('presentation') || mime.contains('powerpoint')) {
+    } else if (mime.contains('presentation') ||
+        mime.contains('powerpoint')) {
       fileIcon = Icons.slideshow_rounded;
       iconColor = const Color(0xFFE67E22);
     } else if (mime.contains('text') ||
@@ -531,7 +537,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Text(
             widget.file.name,
             style: const TextStyle(
-                color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w600),
             textAlign: TextAlign.center,
             maxLines: 3,
             overflow: TextOverflow.ellipsis,
@@ -542,25 +550,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
             children: [
               _badge(widget.file.readableSize),
               const SizedBox(width: 8),
-              _badge(
-                  widget.file.mimeType.split('/').last.toUpperCase()),
+              _badge(widget.file.mimeType.split('/').last.toUpperCase()),
             ],
           ),
           const SizedBox(height: 32),
-
-          // Stream URL box
-          _buildStreamUrlBox(),
-          const SizedBox(height: 16),
-
-          // Copy button
-          _buildCopyButton(),
-          const SizedBox(height: 12),
-
-          // Open in browser button
-          _buildOpenInBrowserButton(),
+          _buildStreamUrlSection(),
           const SizedBox(height: 20),
-
-          // Info hint
           Container(
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
@@ -576,9 +571,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    'The stream URL is a live HTTP link served directly from '
-                    'this device. Open it in a browser, VLC, MX Player, or any '
-                    'app that supports HTTP streaming.',
+                    'The stream URL is a live HTTP link served from this device. '
+                    'Open it in a browser, VLC, MX Player, or any app that '
+                    'supports HTTP streaming.',
                     style: TextStyle(
                       color: Color(0xFF7070A0),
                       fontSize: 12,
@@ -594,112 +589,99 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Shared stream URL widgets ──────────────────────────────────────────────
+  // ── Shared stream URL section ──────────────────────────────────────────────
 
-  Widget _buildStreamUrlBox() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF141420),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF2A2A40)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
+  Widget _buildStreamUrlSection() {
+    return Column(
+      children: [
+        // URL display box
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: const Color(0xFF141420),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF2A2A40)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
-              SizedBox(width: 6),
-              Text(
-                'Stream URL',
-                style: TextStyle(
-                  color: Color(0xFF2AABEE),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 0.5,
+              const Row(
+                children: [
+                  Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
+                  SizedBox(width: 6),
+                  Text(
+                    'Stream URL',
+                    style: TextStyle(
+                      color: Color(0xFF2AABEE),
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              SelectableText(
+                widget.streamUrl,
+                style: const TextStyle(
+                  color: Color(0xFF9090B0),
+                  fontSize: 12,
+                  fontFamily: 'monospace',
+                  height: 1.4,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 8),
-          SelectableText(
-            widget.streamUrl,
-            style: const TextStyle(
-              color: Color(0xFF9090B0),
-              fontSize: 12,
-              fontFamily: 'monospace',
-              height: 1.4,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildStreamUrlRow() {
-    return Column(
-      children: [
-        _buildStreamUrlBox(),
+        ),
         const SizedBox(height: 12),
         Row(
           children: [
-            Expanded(child: _buildCopyButton()),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: widget.streamUrl));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: const Text('Stream URL copied!'),
+                      backgroundColor: const Color(0xFF27AE60),
+                      behavior: SnackBarBehavior.floating,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8)),
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.copy_rounded, size: 16),
+                label: const Text('Copy URL'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Color(0xFF3A3A5A)),
+                  padding: const EdgeInsets.symmetric(vertical: 13),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ),
             const SizedBox(width: 10),
-            Expanded(child: _buildOpenInBrowserButton()),
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: _openInBrowser,
+                icon: const Icon(Icons.open_in_browser_rounded, size: 16),
+                label: const Text('Open in Browser'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2AABEE),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 13),
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ),
           ],
         ),
       ],
-    );
-  }
-
-  Widget _buildCopyButton() {
-    return SizedBox(
-      width: double.infinity,
-      child: OutlinedButton.icon(
-        onPressed: () {
-          Clipboard.setData(ClipboardData(text: widget.streamUrl));
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text('Stream URL copied!'),
-              backgroundColor: const Color(0xFF27AE60),
-              behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8)),
-              duration: const Duration(seconds: 2),
-            ),
-          );
-        },
-        icon: const Icon(Icons.copy_rounded, size: 16),
-        label: const Text('Copy URL'),
-        style: OutlinedButton.styleFrom(
-          foregroundColor: Colors.white,
-          side: const BorderSide(color: Color(0xFF3A3A5A)),
-          padding: const EdgeInsets.symmetric(vertical: 13),
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12)),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildOpenInBrowserButton() {
-    return SizedBox(
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: _openInBrowser,
-        icon: const Icon(Icons.open_in_browser_rounded, size: 16),
-        label: const Text('Open in Browser'),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF2AABEE),
-          foregroundColor: Colors.white,
-          padding: const EdgeInsets.symmetric(vertical: 13),
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12)),
-        ),
-      ),
     );
   }
 
@@ -709,12 +691,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final launched =
           await launchUrl(uri, mode: LaunchMode.externalApplication);
       if (!launched && mounted) {
-        _showSnackError(
-            'Could not open browser. Copy the URL and paste it manually.');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+                'Could not open browser. Copy the URL and paste it manually.'),
+            backgroundColor: const Color(0xFFCF6679),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8)),
+          ),
+        );
       }
     } catch (e) {
       if (mounted) {
-        _showSnackError('Error: $e');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: const Color(0xFFCF6679),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8)),
+          ),
+        );
       }
     }
   }
@@ -726,8 +724,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
+      isScrollControlled: true,
       builder: (_) => Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -740,30 +739,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
             ),
             const SizedBox(height: 20),
-            _buildStreamUrlBox(),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(child: _buildCopyButton()),
-                const SizedBox(width: 10),
-                Expanded(child: _buildOpenInBrowserButton()),
-              ],
-            ),
-            const SizedBox(height: 8),
+            _buildStreamUrlSection(),
           ],
         ),
-      ),
-    );
-  }
-
-  void _showSnackError(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: const Color(0xFFCF6679),
-        behavior: SnackBarBehavior.floating,
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
     );
   }
@@ -771,59 +749,50 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // ── Error view ─────────────────────────────────────────────────────────────
 
   Widget _buildErrorView() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(28),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.error_outline_rounded,
-                color: Color(0xFFCF6679), size: 64),
-            const SizedBox(height: 20),
-            const Text('Playback Error',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600)),
-            const SizedBox(height: 10),
-            Text(
-              _initError ?? 'Unknown error',
-              style: const TextStyle(
-                  color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 20),
-            // Even on error, show stream URL so user can try external player
-            _buildStreamUrlBox(),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(child: _buildCopyButton()),
-                const SizedBox(width: 10),
-                Expanded(child: _buildOpenInBrowserButton()),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                OutlinedButton(
-                  onPressed: () => Navigator.pop(context),
-                  style: OutlinedButton.styleFrom(
-                    side: const BorderSide(color: Color(0xFF3A3A5A)),
-                    foregroundColor: Colors.white,
-                  ),
-                  child: const Text('Go Back'),
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(28),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox(height: 40),
+          const Icon(Icons.error_outline_rounded,
+              color: Color(0xFFCF6679), size: 64),
+          const SizedBox(height: 20),
+          const Text('Playback Error',
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w600)),
+          const SizedBox(height: 10),
+          Text(
+            _initError ?? 'Unknown error',
+            style: const TextStyle(
+                color: Color(0xFF9090B0), fontSize: 14, height: 1.5),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 24),
+          // Stream URL shown even on error so user can try external player
+          _buildStreamUrlSection(),
+          const SizedBox(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              OutlinedButton(
+                onPressed: () => Navigator.pop(context),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Color(0xFF3A3A5A)),
+                  foregroundColor: Colors.white,
                 ),
-                const SizedBox(width: 12),
-                ElevatedButton(
-                  onPressed: _initPlayer,
-                  child: const Text('Retry'),
-                ),
-              ],
-            ),
-          ],
-        ),
+                child: const Text('Go Back'),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton(
+                onPressed: _initPlayer,
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
