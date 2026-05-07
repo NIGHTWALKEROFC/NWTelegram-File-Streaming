@@ -1,9 +1,10 @@
 // lib/screens/files_screen.dart
 //
-// Shows ALL media files (video, audio, documents) from ALL chats the user
-// has joined. Search bar filters by file name in real time.
-// Tap any file → PlayerScreen (streams without downloading).
+// Shows all media files from all Telegram chats.
+// Files appear progressively as each chat is scanned — no waiting for all
+// chats to finish. Search bar filters by name in real time.
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -26,8 +27,11 @@ class _FilesScreenState extends State<FilesScreen>
   // ── State ──────────────────────────────────────────────────────────────────
   List<TelegramFile> _allFiles = [];
   List<TelegramFile> _filtered = [];
-  bool _isLoading = true;
+  bool _isLoading = true;   // true while stream is still emitting
+  bool _hasData = false;    // true once at least one file has arrived
   String? _loadError;
+
+  StreamSubscription<List<TelegramFile>>? _fileSub;
 
   // Filter tab: 0=All, 1=Video, 2=Audio, 3=Docs
   int _tabIndex = 0;
@@ -50,11 +54,12 @@ class _FilesScreenState extends State<FilesScreen>
     });
     _searchController.addListener(_applyFilter);
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _loadFiles());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _startLoading());
   }
 
   @override
   void dispose() {
+    _fileSub?.cancel();
     _tabController.dispose();
     _searchController.dispose();
     _searchFocus.dispose();
@@ -63,28 +68,40 @@ class _FilesScreenState extends State<FilesScreen>
 
   // ── Data loading ───────────────────────────────────────────────────────────
 
-  Future<void> _loadFiles() async {
+  void _startLoading() {
+    _fileSub?.cancel();
+
     setState(() {
+      _allFiles = [];
+      _filtered = [];
       _isLoading = true;
+      _hasData = false;
       _loadError = null;
     });
 
-    try {
-      final svc = context.read<TelegramService>();
-      final files = await svc.getAllMediaFiles(limitPerChat: 50);
-      if (!mounted) return;
-      setState(() {
-        _allFiles = files;
-        _isLoading = false;
-      });
-      _applyFilter();
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _isLoading = false;
-        _loadError = e.toString();
-      });
-    }
+    final svc = context.read<TelegramService>();
+
+    _fileSub = svc.streamAllMediaFiles(limitPerChat: 30).listen(
+      (files) {
+        if (!mounted) return;
+        setState(() {
+          _allFiles = files;
+          _hasData = files.isNotEmpty;
+        });
+        _applyFilter();
+      },
+      onError: (e) {
+        if (!mounted) return;
+        setState(() {
+          _isLoading = false;
+          _loadError = e.toString();
+        });
+      },
+      onDone: () {
+        if (!mounted) return;
+        setState(() => _isLoading = false);
+      },
+    );
   }
 
   void _applyFilter() {
@@ -92,7 +109,6 @@ class _FilesScreenState extends State<FilesScreen>
 
     List<TelegramFile> result = List.of(_allFiles);
 
-    // Tab filter
     switch (_tabIndex) {
       case 1:
         result = result.where((f) => f.isVideo).toList();
@@ -105,11 +121,9 @@ class _FilesScreenState extends State<FilesScreen>
         break;
     }
 
-    // Search filter
     if (query.isNotEmpty) {
-      result = result
-          .where((f) => f.name.toLowerCase().contains(query))
-          .toList();
+      result =
+          result.where((f) => f.name.toLowerCase().contains(query)).toList();
     }
 
     setState(() => _filtered = result);
@@ -121,12 +135,10 @@ class _FilesScreenState extends State<FilesScreen>
     final streamSvc = context.read<StreamService>();
     final telegramSvc = context.read<TelegramService>();
 
-    // Ensure proxy is running
     if (!streamSvc.isRunning) {
       await streamSvc.startServer(telegramSvc);
     }
 
-    // Pick quality: best quality for videos, direct file otherwise
     final quality =
         file.isVideo && file.qualities.isNotEmpty ? file.qualities.first : null;
 
@@ -159,6 +171,13 @@ class _FilesScreenState extends State<FilesScreen>
         children: [
           _buildSearchBar(),
           _buildTabBar(),
+          // Progress bar shown while still loading more files
+          if (_isLoading)
+            LinearProgressIndicator(
+              backgroundColor: const Color(0xFF141420),
+              color: const Color(0xFF2AABEE),
+              minHeight: 2,
+            ),
           Expanded(child: _buildBody()),
         ],
       ),
@@ -188,21 +207,29 @@ class _FilesScreenState extends State<FilesScreen>
           const Text(
             'TG Streamer',
             style: TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-            ),
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w600),
           ),
         ],
       ),
       actions: [
-        // Refresh button
+        if (_allFiles.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Center(
+              child: Text(
+                '${_allFiles.length} files',
+                style: const TextStyle(
+                    color: Color(0xFF5070A0), fontSize: 12),
+              ),
+            ),
+          ),
         IconButton(
           icon: const Icon(Icons.refresh_rounded, color: Colors.white),
           tooltip: 'Refresh',
-          onPressed: _isLoading ? null : _loadFiles,
+          onPressed: _isLoading ? null : _startLoading,
         ),
-        // Logout
         IconButton(
           icon: const Icon(Icons.logout_rounded, color: Colors.white),
           tooltip: 'Logout',
@@ -233,7 +260,8 @@ class _FilesScreenState extends State<FilesScreen>
           style: const TextStyle(color: Colors.white, fontSize: 14),
           decoration: InputDecoration(
             hintText: 'Search files...',
-            hintStyle: const TextStyle(color: Color(0xFF606080), fontSize: 14),
+            hintStyle:
+                const TextStyle(color: Color(0xFF606080), fontSize: 14),
             prefixIcon: const Icon(Icons.search_rounded,
                 color: Color(0xFF2AABEE), size: 20),
             suffixIcon: _searchController.text.isNotEmpty
@@ -275,14 +303,10 @@ class _FilesScreenState extends State<FilesScreen>
         dividerColor: Colors.transparent,
         labelColor: Colors.white,
         unselectedLabelColor: const Color(0xFF7070A0),
-        labelStyle: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w600,
-        ),
-        unselectedLabelStyle: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w500,
-        ),
+        labelStyle:
+            const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+        unselectedLabelStyle:
+            const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
         padding: const EdgeInsets.all(3),
         tabs: _tabs.map((t) => Tab(text: t, height: 32)).toList(),
       ),
@@ -290,14 +314,22 @@ class _FilesScreenState extends State<FilesScreen>
   }
 
   Widget _buildBody() {
-    if (_isLoading) return _buildLoading();
-    if (_loadError != null) return _buildError();
-    if (_allFiles.isEmpty) return _buildEmpty();
+    // Still loading and nothing arrived yet — show spinner
+    if (_isLoading && !_hasData) return _buildInitialLoading();
+
+    // Stream errored before any data
+    if (_loadError != null && !_hasData) return _buildError();
+
+    // Stream finished with zero files
+    if (!_isLoading && _allFiles.isEmpty) return _buildEmpty();
+
+    // Have data (possibly still loading more) but search/tab filter is empty
     if (_filtered.isEmpty) return _buildNoResults();
+
     return _buildFileList();
   }
 
-  Widget _buildLoading() {
+  Widget _buildInitialLoading() {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -312,12 +344,12 @@ class _FilesScreenState extends State<FilesScreen>
           ),
           const SizedBox(height: 20),
           const Text(
-            'Loading your files...',
+            'Scanning your chats...',
             style: TextStyle(color: Color(0xFF9090B0), fontSize: 15),
           ),
           const SizedBox(height: 8),
           const Text(
-            'Scanning all your Telegram chats',
+            'Files will appear as they are found',
             style: TextStyle(color: Color(0xFF5050A0), fontSize: 12),
           ),
         ],
@@ -335,23 +367,19 @@ class _FilesScreenState extends State<FilesScreen>
             const Icon(Icons.error_outline_rounded,
                 color: Color(0xFFCF6679), size: 56),
             const SizedBox(height: 16),
-            const Text(
-              'Failed to load files',
-              style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600),
-            ),
+            const Text('Failed to load files',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
-            Text(
-              _loadError!,
-              textAlign: TextAlign.center,
-              style:
-                  const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
-            ),
+            Text(_loadError!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    color: Color(0xFF9090B0), fontSize: 13)),
             const SizedBox(height: 24),
             ElevatedButton.icon(
-              onPressed: _loadFiles,
+              onPressed: _startLoading,
               icon: const Icon(Icons.refresh_rounded, size: 16),
               label: const Text('Retry'),
             ),
@@ -377,18 +405,16 @@ class _FilesScreenState extends State<FilesScreen>
                 color: Color(0xFF3A3A6A), size: 36),
           ),
           const SizedBox(height: 20),
-          const Text(
-            'No media files found',
-            style: TextStyle(
-                color: Colors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.w600),
-          ),
+          const Text('No media files found',
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600)),
           const SizedBox(height: 8),
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 48),
             child: Text(
-              'No videos, audio or documents were found in your Telegram chats.',
+              'No videos, audio or documents were found in your chats.',
               textAlign: TextAlign.center,
               style: TextStyle(
                   color: Color(0xFF7070A0), fontSize: 13, height: 1.5),
@@ -396,7 +422,7 @@ class _FilesScreenState extends State<FilesScreen>
           ),
           const SizedBox(height: 24),
           OutlinedButton.icon(
-            onPressed: _loadFiles,
+            onPressed: _startLoading,
             icon: const Icon(Icons.refresh_rounded, size: 16),
             label: const Text('Refresh'),
             style: OutlinedButton.styleFrom(
@@ -417,15 +443,23 @@ class _FilesScreenState extends State<FilesScreen>
           const Icon(Icons.search_off_rounded,
               color: Color(0xFF3A3A6A), size: 56),
           const SizedBox(height: 16),
-          const Text(
-            'No results found',
-            style: TextStyle(color: Colors.white, fontSize: 16),
-          ),
+          const Text('No results found',
+              style: TextStyle(color: Colors.white, fontSize: 16)),
           const SizedBox(height: 6),
           Text(
-            'No files match "${_searchController.text}"',
-            style: const TextStyle(color: Color(0xFF7070A0), fontSize: 13),
+            _searchController.text.isNotEmpty
+                ? 'No files match "${_searchController.text}"'
+                : 'No files in this category yet',
+            style:
+                const TextStyle(color: Color(0xFF7070A0), fontSize: 13),
           ),
+          if (_isLoading) ...[
+            const SizedBox(height: 16),
+            const Text(
+              'Still scanning — more files may appear shortly',
+              style: TextStyle(color: Color(0xFF5050A0), fontSize: 12),
+            ),
+          ],
         ],
       ),
     );
@@ -435,13 +469,11 @@ class _FilesScreenState extends State<FilesScreen>
     return RefreshIndicator(
       color: const Color(0xFF2AABEE),
       backgroundColor: const Color(0xFF141420),
-      onRefresh: _loadFiles,
+      onRefresh: () async => _startLoading(),
       child: ListView.builder(
         padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
         itemCount: _filtered.length,
-        itemBuilder: (context, index) {
-          return _buildFileCard(_filtered[index]);
-        },
+        itemBuilder: (context, index) => _buildFileCard(_filtered[index]),
       ),
     );
   }
@@ -462,11 +494,8 @@ class _FilesScreenState extends State<FilesScreen>
         ),
         child: Row(
           children: [
-            // Thumbnail or icon
             _buildThumbOrIcon(file, iconData, iconColor),
             const SizedBox(width: 14),
-
-            // File info
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -505,8 +534,6 @@ class _FilesScreenState extends State<FilesScreen>
                 ],
               ),
             ),
-
-            // Play button
             const SizedBox(width: 10),
             Container(
               width: 38,
@@ -533,7 +560,6 @@ class _FilesScreenState extends State<FilesScreen>
 
   Widget _buildThumbOrIcon(
       TelegramFile file, IconData iconData, Color iconColor) {
-    // Try to show thumbnail if available
     if (file.thumbnail != null && file.thumbnail!.isNotEmpty) {
       return ClipRRect(
         borderRadius: BorderRadius.circular(10),
@@ -542,8 +568,7 @@ class _FilesScreenState extends State<FilesScreen>
           width: 56,
           height: 56,
           fit: BoxFit.cover,
-          errorBuilder: (_, __, ___) =>
-              _iconBox(iconData, iconColor),
+          errorBuilder: (_, __, ___) => _iconBox(iconData, iconColor),
         ),
       );
     }
@@ -626,8 +651,6 @@ class _FilesScreenState extends State<FilesScreen>
     return const Color(0xFF27AE60);
   }
 
-  // ── Logout ─────────────────────────────────────────────────────────────────
-
   Future<void> _confirmLogout() async {
     final confirm = await showDialog<bool>(
       context: context,
@@ -635,8 +658,8 @@ class _FilesScreenState extends State<FilesScreen>
         backgroundColor: const Color(0xFF141420),
         shape:
             RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Logout',
-            style: TextStyle(color: Colors.white)),
+        title:
+            const Text('Logout', style: TextStyle(color: Colors.white)),
         content: const Text(
           'Are you sure you want to logout?',
           style: TextStyle(color: Color(0xFF9090B0)),
@@ -656,10 +679,9 @@ class _FilesScreenState extends State<FilesScreen>
     );
 
     if (confirm == true && mounted) {
+      _fileSub?.cancel();
       await context.read<TelegramService>().logout();
-      if (mounted) {
-        Navigator.of(context).pushReplacementNamed('/');
-      }
+      if (mounted) Navigator.of(context).pushReplacementNamed('/');
     }
   }
 }
