@@ -298,8 +298,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         bottomButtonBar: [
           const MaterialPositionIndicator(),
           const Spacer(),
-          const MaterialSpeedButton(),
-          const MaterialFullscreenButton(),
+          MaterialSpeedButton(),
+          MaterialFullscreenButton(),
         ],
         volumeGesture: true,
         brightnessGesture: true,
