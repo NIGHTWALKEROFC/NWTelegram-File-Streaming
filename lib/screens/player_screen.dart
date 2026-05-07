@@ -298,7 +298,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
         bottomButtonBar: [
           const MaterialPositionIndicator(),
           const Spacer(),
-          MaterialSpeedButton(),
+          // Speed picker — MaterialCustomButton is the correct API for custom
+          // buttons in mobile controls. MaterialSpeedButton does not exist.
+          MaterialCustomButton(
+            onPressed: () => _showSpeedPicker(),
+            icon: const Icon(Icons.speed_rounded, color: Colors.white),
+          ),
           MaterialFullscreenButton(),
         ],
         volumeGesture: true,
@@ -330,6 +335,88 @@ class _PlayerScreenState extends State<PlayerScreen> {
           await SystemChrome.setEnabledSystemUIMode(
               SystemUiMode.edgeToEdge);
         },
+      ),
+    );
+  }
+
+  // ── Speed picker ───────────────────────────────────────────────────────────
+
+  void _showSpeedPicker() {
+    const speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141420),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF3A3A5A),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(left: 8, bottom: 10),
+              child: Text('Playback Speed',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15)),
+            ),
+            StreamBuilder<double>(
+              stream: _player?.stream.rate,
+              initialData: 1.0,
+              builder: (ctx, snap) {
+                final current = snap.data ?? 1.0;
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: speeds.map((s) {
+                    final selected = (s - current).abs() < 0.01;
+                    return GestureDetector(
+                      onTap: () {
+                        _player?.setRate(s);
+                        Navigator.pop(ctx);
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? const Color(0xFF2AABEE)
+                              : const Color(0xFF1E1E35),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          s == 1.0 ? 'Normal' : '${s}x',
+                          style: TextStyle(
+                            color: selected
+                                ? Colors.white
+                                : const Color(0xFF9090B0),
+                            fontWeight: selected
+                                ? FontWeight.w700
+                                : FontWeight.normal,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                );
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
