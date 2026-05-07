@@ -1,18 +1,4 @@
 // lib/services/telegram_service.dart
-//
-// KEY FIX for "document streaming not supported":
-// ================================================
-// Telegram sends files like .mkv, .mp4, .avi as messageDocument — not as
-// messageVideo. So _parseDocument() was always creating TelegramFileType.document
-// regardless of whether the file was actually a video or audio.
-//
-// Fix: _parseDocument now checks mime type AND file extension to assign the
-// correct TelegramFileType. Combined with the updated TelegramFile.isVideo /
-// isAudio getters, all video/audio files now route to the correct player.
-//
-// Polling architecture (unchanged from last working version):
-// - Timer.periodic(10ms) + tdReceive(0.0) on MAIN isolate
-// - No background isolates, no compute() — plugin registered on main isolate
 
 import 'dart:async';
 import 'dart:convert';
@@ -115,7 +101,7 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // ── Polling loop ───────────────────────────────────────────────────────────
+  // ── Polling loop — main isolate, 10 ms, non-blocking ──────────────────────
 
   void _startPolling() {
     _pollTimer?.cancel();
@@ -213,13 +199,13 @@ class TelegramService extends ChangeNotifier {
         return;
       }
       if (u['@type'] == 'updateAuthorizationState') {
-        final type =
+        final t =
             (u['authorization_state'] as Map<String, dynamic>?)?['@type']
                 as String?;
-        if (type == 'authorizationStateWaitCode' ||
-            type == 'authorizationStateWaitOtherDeviceConfirmation' ||
-            type == 'authorizationStateWaitPassword' ||
-            type == 'authorizationStateReady') {
+        if (t == 'authorizationStateWaitCode' ||
+            t == 'authorizationStateWaitOtherDeviceConfirmation' ||
+            t == 'authorizationStateWaitPassword' ||
+            t == 'authorizationStateReady') {
           completer.complete(true);
           sub.cancel();
         }
@@ -277,11 +263,11 @@ class TelegramService extends ChangeNotifier {
         return;
       }
       if (u['@type'] == 'updateAuthorizationState') {
-        final type =
+        final t =
             (u['authorization_state'] as Map<String, dynamic>?)?['@type']
                 as String?;
-        if (type == 'authorizationStateReady' ||
-            type == 'authorizationStateWaitPassword') {
+        if (t == 'authorizationStateReady' ||
+            t == 'authorizationStateWaitPassword') {
           completer.complete(true);
           sub.cancel();
         }
@@ -327,10 +313,10 @@ class TelegramService extends ChangeNotifier {
         return;
       }
       if (u['@type'] == 'updateAuthorizationState') {
-        final type =
+        final t =
             (u['authorization_state'] as Map<String, dynamic>?)?['@type']
                 as String?;
-        if (type == 'authorizationStateReady') {
+        if (t == 'authorizationStateReady') {
           completer.complete(true);
           sub.cancel();
         }
@@ -484,29 +470,25 @@ class TelegramService extends ChangeNotifier {
     );
   }
 
-  // ── KEY FIX: _parseDocument now detects real type from mime + extension ─────
-  //
+  // FIX: Check mime type and file extension to detect real type.
   // Telegram sends .mkv, .mp4, .avi etc. as messageDocument.
-  // We check mime type first, then fall back to file extension.
-  // This means a .mkv file correctly gets isVideo=true and plays in the
-  // video player instead of showing the dead-end document screen.
-
+  // Uses public static helpers TelegramFile.mimeIsVideo / mimeIsAudio.
   TelegramFile? _parseDocument(Map<String, dynamic> content) {
     final doc = content['document'] as Map<String, dynamic>?;
     final file = doc?['document'] as Map<String, dynamic>?;
     if (doc == null || file == null) return null;
 
     final fileName = doc['file_name'] as String? ?? 'file';
-    final mimeType = doc['mime_type'] as String? ?? 'application/octet-stream';
+    final mimeType =
+        doc['mime_type'] as String? ?? 'application/octet-stream';
 
-    // Determine the real type from mime, then fall back to extension
+    // Determine real type: mime first, then extension fallback
     TelegramFileType realType;
-    if (TelegramFile._mimeIsVideo(mimeType)) {
+    if (TelegramFile.mimeIsVideo(mimeType)) {
       realType = TelegramFileType.video;
-    } else if (TelegramFile._mimeIsAudio(mimeType)) {
+    } else if (TelegramFile.mimeIsAudio(mimeType)) {
       realType = TelegramFileType.audio;
     } else {
-      // Mime was not conclusive — check extension
       realType = TelegramFile.typeFromExtension(fileName);
     }
 
