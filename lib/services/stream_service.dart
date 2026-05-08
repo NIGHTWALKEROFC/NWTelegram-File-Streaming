@@ -198,14 +198,17 @@ class StreamService extends ChangeNotifier {
   // ── Chunk fetcher ──────────────────────────────────────────────────────────
   //
   // downloadFile(synchronous:true) blocks until TDLib has the bytes locally.
-  // However, in rare cases TDLib returns downloaded_prefix_size=0 even with
-  // synchronous:true — this happens on the very first chunk when TDLib is
-  // still negotiating the DC connection. We retry up to 8 times with 500ms
-  // delay for that specific case (empty bytes from a non-EOF position).
   //
-  // null  = hard error (network down, invalid file_id) — stop streaming
-  // empty = either EOF or TDLib not ready yet — retry up to 8 times, then
-  //         treat as EOF if we're past the expected file size
+  // Retry logic:
+  //   - null  = hard TDLib error → stop immediately
+  //   - empty at offset=0 = TDLib not ready (CDN auth in progress) → retry
+  //   - empty at offset>0 = seek target not downloaded yet → retry longer
+  //   - empty after max retries = treat as EOF
+  //
+  // Seeking works because libmpv sends a new Range request with the seek
+  // offset. We call downloadFile(offset=seekTarget) which tells TDLib to
+  // start downloading from that point. TDLib cancels the old download and
+  // starts the new one — may take a few seconds for first bytes at new pos.
 
   void _fetchChunks(
     int start,
@@ -226,28 +229,34 @@ class StreamService extends ChangeNotifier {
           final count = remaining.clamp(1, kChunkSize);
 
           Uint8List? bytes;
-          // Up to 8 retries for empty-but-not-EOF case
-          for (int attempt = 0; attempt < 8; attempt++) {
+
+          // More retries for seek (non-zero offset) since TDLib must
+          // reposition its download — first chunk after seek can take 10-15s
+          final maxRetries = offset > 0 ? 30 : 12;
+          final retryDelay = offset > 0
+              ? const Duration(milliseconds: 600)
+              : const Duration(milliseconds: 400);
+
+          for (int attempt = 0; attempt < maxRetries; attempt++) {
             if (controller.isClosed) break;
             bytes = await _telegramService!.downloadFilePart(
               fileId: _activeFileId,
               offset: offset,
               count: count,
             );
-            if (bytes == null) break;             // hard error — stop
-            if (bytes.isNotEmpty) break;           // got data — proceed
-            // empty: TDLib not ready or EOF — wait and retry
+            if (bytes == null) break;        // hard error — stop
+            if (bytes.isNotEmpty) break;     // got data — proceed
             debugPrint(
-                'StreamService: empty at offset=$offset attempt=$attempt');
-            await Future.delayed(const Duration(milliseconds: 500));
+                'StreamService: empty at offset=$offset attempt=$attempt/$maxRetries');
+            await Future.delayed(retryDelay);
           }
 
           if (bytes == null) {
-            debugPrint('StreamService: null bytes at offset=$offset, stopping');
+            debugPrint('StreamService: hard error at offset=$offset');
             break;
           }
           if (bytes.isEmpty) {
-            debugPrint('StreamService: EOF at offset=$offset');
+            debugPrint('StreamService: EOF/timeout at offset=$offset');
             break;
           }
 
@@ -265,7 +274,6 @@ class StreamService extends ChangeNotifier {
       }
     });
   }
-
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   (int, int)? _parseRange(String header, int fileSize) {
