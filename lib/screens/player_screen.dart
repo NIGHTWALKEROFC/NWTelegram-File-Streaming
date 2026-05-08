@@ -1,23 +1,4 @@
 // lib/screens/player_screen.dart
-//
-// FIXES vs previous version:
-// ===========================
-// 1. Audio now uses media_kit (libmpv) instead of just_audio.
-//    just_audio could not get duration from the proxy stream for OGG/OPUS/FLAC
-//    because it relies on HTTP Content-Length + its own demuxer for duration.
-//    libmpv demuxes the stream directly and reports duration as soon as the
-//    first few KB arrive — works for every format.
-//
-// 2. Race condition fixed: setActiveFile is called by files_screen BEFORE
-//    Navigator.push, so by the time initState runs the proxy already has the
-//    correct fileId. player.open() in addPostFrameCallback is safe.
-//
-// 3. Audio player state (position, duration, playing) comes from
-//    player.stream.* just like the video path — single code path, no
-//    separate AudioPlayer instance needed.
-//
-// 4. just_audio dependency is now unused in this file (kept in pubspec for
-//    any future use but not imported here).
 
 import 'dart:async';
 
@@ -25,18 +6,21 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:provider/provider.dart';
 
 import '../models/telegram_file.dart';
+import '../services/stream_service.dart';
+import '../services/telegram_service.dart';
 
 class PlayerScreen extends StatefulWidget {
   final TelegramFile file;
-  final VideoQuality? selectedQuality;
+  final VideoQuality? initialQuality;
   final String streamUrl;
 
   const PlayerScreen({
     super.key,
     required this.file,
-    required this.selectedQuality,
+    required this.initialQuality,
     required this.streamUrl,
   });
 
@@ -45,81 +29,107 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // Single Player + VideoController for both video and audio.
-  // For audio we just don't show the Video widget.
   late final Player _player;
   late final VideoController _videoController;
 
-  // UI state driven by player.stream.*
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
   bool _playing = false;
   bool _buffering = true;
-  String? _initError;
+  String? _error;
+
+  // Current quality being played
+  late VideoQuality? _currentQuality;
 
   final List<StreamSubscription<dynamic>> _subs = [];
 
   @override
   void initState() {
     super.initState();
+    _currentQuality = widget.initialQuality;
 
     _player = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 8 * 1024 * 1024, // 8 MB buffer
+        bufferSize: 16 * 1024 * 1024, // 16 MB
         logLevel: MPVLogLevel.warn,
       ),
     );
     _videoController = VideoController(_player);
 
-    // Listen to player streams for UI updates
-    _subs.add(_player.stream.position.listen((p) {
-      if (mounted) setState(() => _position = p);
-    }));
-    _subs.add(_player.stream.duration.listen((d) {
-      if (mounted) setState(() => _duration = d);
-    }));
-    _subs.add(_player.stream.playing.listen((v) {
-      if (mounted) setState(() => _playing = v);
-    }));
-    _subs.add(_player.stream.buffering.listen((v) {
-      if (mounted) setState(() => _buffering = v);
-    }));
+    _subs.add(_player.stream.position.listen(
+        (p) { if (mounted) setState(() => _position = p); }));
+    _subs.add(_player.stream.duration.listen(
+        (d) { if (mounted) setState(() => _duration = d); }));
+    _subs.add(_player.stream.playing.listen(
+        (v) { if (mounted) setState(() => _playing = v); }));
+    _subs.add(_player.stream.buffering.listen(
+        (v) { if (mounted) setState(() => _buffering = v); }));
     _subs.add(_player.stream.error.listen((err) {
-      if (err.isNotEmpty && mounted && _initError == null) {
+      if (err.isNotEmpty && mounted) {
         debugPrint('media_kit error: $err');
-        setState(() => _initError = err);
+        setState(() => _error = err);
       }
     }));
 
-    // Open after first frame so the Video widget's Texture is registered
-    // and the proxy server has had time to bind.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _openMedia();
+      if (mounted) _openMedia();
     });
   }
 
   void _openMedia() {
-    _player.open(
-      Media(
-        widget.streamUrl,
-        httpHeaders: const {
-          'Accept': '*/*',
-          'Connection': 'keep-alive',
-        },
-      ),
-    );
-  }
-
-  void _retryMedia() {
     if (!mounted) return;
     setState(() {
-      _initError = null;
+      _error = null;
       _buffering = true;
     });
-    Future.delayed(const Duration(milliseconds: 400), () {
-      if (mounted) _openMedia();
+    _player.open(Media(widget.streamUrl,
+        httpHeaders: const {'Accept': '*/*', 'Connection': 'keep-alive'}));
+  }
+
+  // Switch to a different quality — re-prewarms and restarts stream
+  Future<void> _switchQuality(VideoQuality q) async {
+    if (!mounted) return;
+    final streamSvc = context.read<StreamService>();
+    final telegramSvc = context.read<TelegramService>();
+
+    // Stop current playback
+    await _player.pause();
+
+    setState(() {
+      _currentQuality = q;
+      _buffering = true;
+      _error = null;
     });
+
+    // Show loading snack
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Row(children: [
+        const SizedBox(
+          width: 16, height: 16,
+          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+        ),
+        const SizedBox(width: 12),
+        Text('Switching to ${q.label}...'),
+      ]),
+      backgroundColor: const Color(0xFF1A1A2E),
+      duration: const Duration(seconds: 10),
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    ));
+
+    // Prewarm new quality
+    await telegramSvc.prewarmFile(q.fileId);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    streamSvc.setActiveFile(
+      fileId: q.fileId,
+      fileSize: q.fileSize,
+      mimeType: widget.file.mimeType,
+    );
+
+    _openMedia();
   }
 
   @override
@@ -129,9 +139,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       DeviceOrientation.portraitDown,
     ]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    for (final s in _subs) {
-      s.cancel();
-    }
+    for (final s in _subs) s.cancel();
     _player.dispose();
     super.dispose();
   }
@@ -140,22 +148,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Error screen (video only — audio/doc shows inline)
-    if (_initError != null && widget.file.isVideo) {
-      return Scaffold(
-        backgroundColor: const Color(0xFF0A0A0F),
-        appBar: _buildAppBar(),
-        body: _buildErrorView(),
-      );
-    }
-
     if (widget.file.isVideo) {
       return Scaffold(
         backgroundColor: Colors.black,
         body: _buildVideoView(),
       );
     }
-
     if (widget.file.isAudio) {
       return Scaffold(
         backgroundColor: const Color(0xFF0A0A0F),
@@ -163,8 +161,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         body: _buildAudioView(),
       );
     }
-
-    // Non-playable document
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0F),
       appBar: _buildAppBar(),
@@ -178,18 +174,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
           icon: const Icon(Icons.arrow_back, color: Colors.white),
           onPressed: () => Navigator.pop(context),
         ),
-        title: Text(
-          widget.file.name,
-          style: const TextStyle(color: Colors.white, fontSize: 15),
-          overflow: TextOverflow.ellipsis,
-        ),
+        title: Text(widget.file.name,
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+            overflow: TextOverflow.ellipsis),
       );
 
-  // ── Video ──────────────────────────────────────────────────────────────────
+  // ── Video player ───────────────────────────────────────────────────────────
 
   Widget _buildVideoView() {
-    final qualityLabel = widget.selectedQuality?.label ??
-        (widget.file.height > 0 ? '${widget.file.height}p' : '');
+    final qualities = widget.file.qualities;
+    final currentLabel = _currentQuality?.label ?? '';
 
     return MaterialVideoControlsTheme(
       normal: MaterialVideoControlsThemeData(
@@ -197,19 +191,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
         seekBarColor: const Color(0xFF3A3A5A),
         seekBarPositionColor: const Color(0xFF2AABEE),
         seekBarThumbColor: const Color(0xFF2AABEE),
+        // Extra bottom padding so buttons are ABOVE the gesture navigation bar
+        bottomButtonBarMargin:
+            const EdgeInsets.fromLTRB(16, 0, 16, 16),
         primaryButtonBar: [
           const Spacer(),
           const MaterialPlayOrPauseButton(iconSize: 48),
           const Spacer(),
         ],
         topButtonBar: [
+          // Back button
           GestureDetector(
             onTap: () => Navigator.pop(context),
             child: Container(
-              margin: const EdgeInsets.only(left: 4),
+              margin: const EdgeInsets.only(left: 8, top: 4),
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.45),
+                color: Colors.black.withOpacity(0.5),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: const Icon(Icons.arrow_back,
@@ -217,22 +215,40 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
           const Spacer(),
-          if (qualityLabel.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
+          // Quality badge / picker button
+          if (qualities.isNotEmpty)
+            GestureDetector(
+              onTap: () => _showQualityPicker(qualities),
               child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                margin: const EdgeInsets.only(right: 8, top: 4),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
                   color: Colors.black.withOpacity(0.6),
                   borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: const Color(0xFF2AABEE).withOpacity(0.6),
+                    width: 1,
+                  ),
                 ),
-                child: Text(
-                  qualityLabel,
-                  style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.hd_rounded,
+                        color: Color(0xFF2AABEE), size: 14),
+                    const SizedBox(width: 4),
+                    Text(
+                      currentLabel.isNotEmpty ? currentLabel : 'Auto',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(width: 2),
+                    const Icon(Icons.arrow_drop_down,
+                        color: Colors.white, size: 14),
+                  ],
                 ),
               ),
             ),
@@ -242,18 +258,69 @@ class _PlayerScreenState extends State<PlayerScreen> {
           const Spacer(),
           MaterialCustomButton(
             onPressed: _showSpeedPicker,
-            icon: const Icon(Icons.speed_rounded, color: Colors.white),
+            icon: const Icon(Icons.speed_rounded,
+                color: Colors.white, size: 20),
           ),
+          // Fullscreen button — inside bottomButtonBarMargin so it sits
+          // above Android gesture nav bar
           const MaterialFullscreenButton(),
         ],
         volumeGesture: true,
         brightnessGesture: true,
         seekGesture: true,
       ),
-      fullscreen: const MaterialVideoControlsThemeData(
+      fullscreen: MaterialVideoControlsThemeData(
+        bottomButtonBarMargin:
+            const EdgeInsets.fromLTRB(16, 0, 16, 16),
         volumeGesture: true,
         brightnessGesture: true,
         seekGesture: true,
+        topButtonBar: [
+          const Spacer(),
+          if (qualities.isNotEmpty)
+            GestureDetector(
+              onTap: () => _showQualityPicker(qualities),
+              child: Container(
+                margin: const EdgeInsets.only(right: 8, top: 4),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: const Color(0xFF2AABEE).withOpacity(0.6),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.hd_rounded,
+                        color: Color(0xFF2AABEE), size: 14),
+                    const SizedBox(width: 4),
+                    Text(
+                      currentLabel.isNotEmpty ? currentLabel : 'Auto',
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700),
+                    ),
+                    const Icon(Icons.arrow_drop_down,
+                        color: Colors.white, size: 14),
+                  ],
+                ),
+              ),
+            ),
+        ],
+        bottomButtonBar: [
+          const MaterialPositionIndicator(),
+          const Spacer(),
+          MaterialCustomButton(
+            onPressed: _showSpeedPicker,
+            icon: const Icon(Icons.speed_rounded,
+                color: Colors.white, size: 20),
+          ),
+          const MaterialFullscreenButton(),
+        ],
       ),
       child: Video(
         controller: _videoController,
@@ -278,17 +345,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Speed picker ───────────────────────────────────────────────────────────
+  // ── Quality picker ─────────────────────────────────────────────────────────
+  // Shows only qualities up to the file's best quality (no upscaling options).
+  // Sorted highest → lowest. Current quality is highlighted.
 
-  void _showSpeedPicker() {
-    const speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+  void _showQualityPicker(List<VideoQuality> qualities) {
+    // qualities list is already sorted highest→lowest from telegram_service
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF141420),
       shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (_) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -299,18 +368,148 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 height: 4,
                 margin: const EdgeInsets.only(bottom: 16),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF3A3A5A),
-                  borderRadius: BorderRadius.circular(2),
-                ),
+                    color: const Color(0xFF3A3A5A),
+                    borderRadius: BorderRadius.circular(2)),
               ),
             ),
             const Padding(
-              padding: EdgeInsets.only(left: 8, bottom: 10),
+              padding: EdgeInsets.only(left: 4, bottom: 12),
+              child: Text('Video Quality',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600)),
+            ),
+            // Auto option (lowest quality = fastest)
+            _qualityTile(
+              label: 'Auto (${qualities.last.label})',
+              sublabel: 'Fastest · ${qualities.last.readableSize}',
+              isSelected: _currentQuality?.fileId == qualities.last.fileId,
+              isAuto: true,
+              onTap: () {
+                Navigator.pop(context);
+                if (_currentQuality?.fileId != qualities.last.fileId) {
+                  _switchQuality(qualities.last);
+                }
+              },
+            ),
+            const Divider(color: Color(0xFF2A2A40), height: 20),
+            // All qualities highest → lowest
+            ...qualities.map((q) => _qualityTile(
+                  label: q.label,
+                  sublabel: q.readableSize,
+                  isSelected: _currentQuality?.fileId == q.fileId,
+                  isAuto: false,
+                  onTap: () {
+                    Navigator.pop(context);
+                    if (_currentQuality?.fileId != q.fileId) {
+                      _switchQuality(q);
+                    }
+                  },
+                )),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _qualityTile({
+    required String label,
+    required String sublabel,
+    required bool isSelected,
+    required bool isAuto,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 6),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? const Color(0xFF2AABEE).withOpacity(0.15)
+              : const Color(0xFF1A1A2E),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: isSelected
+                ? const Color(0xFF2AABEE)
+                : const Color(0xFF2A2A40),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              isAuto
+                  ? Icons.auto_awesome_rounded
+                  : Icons.hd_rounded,
+              color: isSelected
+                  ? const Color(0xFF2AABEE)
+                  : const Color(0xFF7070A0),
+              size: 18,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(label,
+                      style: TextStyle(
+                        color: isSelected
+                            ? Colors.white
+                            : const Color(0xFFD0D0E0),
+                        fontSize: 14,
+                        fontWeight: isSelected
+                            ? FontWeight.w700
+                            : FontWeight.w500,
+                      )),
+                  Text(sublabel,
+                      style: const TextStyle(
+                          color: Color(0xFF7070A0), fontSize: 11)),
+                ],
+              ),
+            ),
+            if (isSelected)
+              const Icon(Icons.check_circle_rounded,
+                  color: Color(0xFF2AABEE), size: 18),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Speed picker ───────────────────────────────────────────────────────────
+
+  void _showSpeedPicker() {
+    const speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141420),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 16),
+                decoration: BoxDecoration(
+                    color: const Color(0xFF3A3A5A),
+                    borderRadius: BorderRadius.circular(2)),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(left: 4, bottom: 12),
               child: Text('Playback Speed',
                   style: TextStyle(
                       color: Colors.white,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 15)),
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600)),
             ),
             StreamBuilder<double>(
               stream: _player.stream.rate,
@@ -360,11 +559,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Audio ──────────────────────────────────────────────────────────────────
-  //
-  // Uses the same _player (libmpv) as video — supports every audio format
-  // including OGG, OPUS, FLAC, AAC, MP3. Duration is read from the stream
-  // by libmpv's demuxer, so it works even without Content-Length headers.
+  // ── Audio player ───────────────────────────────────────────────────────────
 
   Widget _buildAudioView() {
     final hasDuration = _duration.inSeconds > 0;
@@ -378,7 +573,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       child: Column(
         children: [
           const SizedBox(height: 32),
-          // Album art / icon
+          // Artwork
           Container(
             width: 180,
             height: 180,
@@ -396,68 +591,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     spreadRadius: 4)
               ],
             ),
-            child: _buffering && !_playing
+            child: (_buffering && !_playing)
                 ? const Center(
                     child: SizedBox(
-                      width: 40,
-                      height: 40,
+                      width: 40, height: 40,
                       child: CircularProgressIndicator(
-                        color: Colors.white,
-                        strokeWidth: 2.5,
-                      ),
+                          color: Colors.white, strokeWidth: 2.5),
                     ),
                   )
                 : const Icon(Icons.music_note_rounded,
                     color: Colors.white, size: 72),
           ),
           const SizedBox(height: 32),
-          Text(
-            widget.file.name,
-            style: const TextStyle(
-                color: Colors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.w600),
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
+          Text(widget.file.name,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis),
           const SizedBox(height: 6),
           Text(
             widget.file.mimeType.toUpperCase().replaceAll('AUDIO/', ''),
-            style:
-                const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
+            style: const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
           ),
 
-          // Error inline
-          if (_initError != null) ...[
+          // Error banner
+          if (_error != null) ...[
             const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF2A1020),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFFCF6679)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.error_outline_rounded,
-                      color: Color(0xFFCF6679), size: 18),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      _initError!,
-                      style: const TextStyle(
-                          color: Color(0xFF9090B0), fontSize: 12),
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: _retryMedia,
-                    child: const Text('Retry',
-                        style: TextStyle(color: Color(0xFF2AABEE))),
-                  ),
-                ],
-              ),
-            ),
+            _errorBanner(),
           ],
 
           const SizedBox(height: 28),
@@ -495,7 +658,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ],
             ),
           ),
-
           const SizedBox(height: 20),
 
           // Controls
@@ -508,8 +670,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     color: Colors.white),
                 onPressed: () {
                   final p = _position - const Duration(seconds: 10);
-                  _player.seek(
-                      p < Duration.zero ? Duration.zero : p);
+                  _player.seek(p < Duration.zero ? Duration.zero : p);
                 },
               ),
               const SizedBox(width: 12),
@@ -547,8 +708,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ? () {
                         final p =
                             _position + const Duration(seconds: 30);
-                        _player.seek(
-                            p > _duration ? _duration : p);
+                        _player.seek(p > _duration ? _duration : p);
                       }
                     : null,
               ),
@@ -565,26 +725,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Widget _buildDocumentView() {
     final mime = widget.file.mimeType.toLowerCase();
-    final IconData icon;
-    final Color color;
+    IconData icon;
+    Color color;
 
     if (mime.contains('pdf')) {
       icon = Icons.picture_as_pdf_rounded;
       color = const Color(0xFFE74C3C);
-    } else if (mime.contains('zip') ||
-        mime.contains('rar') ||
-        mime.contains('7z') ||
-        mime.contains('tar') ||
+    } else if (mime.contains('zip') || mime.contains('rar') ||
+        mime.contains('7z') || mime.contains('tar') ||
         mime.contains('gz')) {
       icon = Icons.folder_zip_rounded;
       color = const Color(0xFFF39C12);
-    } else if (mime.contains('word') ||
-        mime.contains('msword') ||
+    } else if (mime.contains('word') || mime.contains('msword') ||
         mime.contains('document')) {
       icon = Icons.description_rounded;
       color = const Color(0xFF2980B9);
-    } else if (mime.contains('sheet') ||
-        mime.contains('excel') ||
+    } else if (mime.contains('sheet') || mime.contains('excel') ||
         mime.contains('spreadsheet')) {
       icon = Icons.table_chart_rounded;
       color = const Color(0xFF27AE60);
@@ -613,16 +769,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Icon(icon, color: color, size: 50),
           ),
           const SizedBox(height: 18),
-          Text(
-            widget.file.name,
-            style: const TextStyle(
-                color: Colors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.w600),
-            textAlign: TextAlign.center,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-          ),
+          Text(widget.file.name,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis),
           const SizedBox(height: 10),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -636,64 +790,42 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _buildStreamUrlCard(),
           const SizedBox(height: 16),
           _buildInfoCard(
-            'This is a document file. Copy the stream URL and open it '
-            'in any app that supports HTTP streaming or downloading.',
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ── Error view (video only) ────────────────────────────────────────────────
-
-  Widget _buildErrorView() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(28),
-      child: Column(
-        children: [
-          const SizedBox(height: 40),
-          const Icon(Icons.error_outline_rounded,
-              color: Color(0xFFCF6679), size: 60),
-          const SizedBox(height: 16),
-          const Text('Playback Error',
-              style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600)),
-          const SizedBox(height: 10),
-          Text(
-            _initError ?? 'Unknown error',
-            style: const TextStyle(
-                color: Color(0xFF9090B0), fontSize: 13, height: 1.5),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 20),
-          _buildStreamUrlCard(),
-          const SizedBox(height: 20),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              OutlinedButton(
-                onPressed: () => Navigator.pop(context),
-                style: OutlinedButton.styleFrom(
-                    side: const BorderSide(color: Color(0xFF3A3A5A)),
-                    foregroundColor: Colors.white),
-                child: const Text('Go Back'),
-              ),
-              const SizedBox(width: 12),
-              ElevatedButton.icon(
-                onPressed: _retryMedia,
-                icon: const Icon(Icons.refresh_rounded, size: 16),
-                label: const Text('Retry'),
-              ),
-            ],
-          ),
+              'Copy the stream URL and open it in any app that '
+              'supports HTTP streaming or direct download.'),
         ],
       ),
     );
   }
 
   // ── Shared widgets ─────────────────────────────────────────────────────────
+
+  Widget _errorBanner() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A1020),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFCF6679)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.error_outline_rounded,
+              color: Color(0xFFCF6679), size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(_error!,
+                style: const TextStyle(
+                    color: Color(0xFF9090B0), fontSize: 12)),
+          ),
+          TextButton(
+            onPressed: _openMedia,
+            child: const Text('Retry',
+                style: TextStyle(color: Color(0xFF2AABEE))),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildStreamUrlCard() {
     return Container(
@@ -707,45 +839,37 @@ class _PlayerScreenState extends State<PlayerScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
-            children: [
-              Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
-              SizedBox(width: 6),
-              Text('Stream URL',
-                  style: TextStyle(
+          const Row(children: [
+            Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
+            SizedBox(width: 6),
+            Text('Stream URL',
+                style: TextStyle(
                     color: Color(0xFF2AABEE),
                     fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.5,
-                  )),
-            ],
-          ),
+                    fontWeight: FontWeight.w600)),
+          ]),
           const SizedBox(height: 8),
-          SelectableText(
-            widget.streamUrl,
-            style: const TextStyle(
-              color: Color(0xFF9090B0),
-              fontSize: 12,
-              fontFamily: 'monospace',
-              height: 1.4,
-            ),
-          ),
+          SelectableText(widget.streamUrl,
+              style: const TextStyle(
+                  color: Color(0xFF9090B0),
+                  fontSize: 12,
+                  fontFamily: 'monospace',
+                  height: 1.4)),
           const SizedBox(height: 10),
           SizedBox(
             width: double.infinity,
             child: OutlinedButton.icon(
               onPressed: () {
-                Clipboard.setData(ClipboardData(text: widget.streamUrl));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: const Text('Stream URL copied!'),
-                    backgroundColor: const Color(0xFF27AE60),
-                    behavior: SnackBarBehavior.floating,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8)),
-                    duration: const Duration(seconds: 2),
-                  ),
-                );
+                Clipboard.setData(
+                    ClipboardData(text: widget.streamUrl));
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: const Text('Stream URL copied!'),
+                  backgroundColor: const Color(0xFF27AE60),
+                  behavior: SnackBarBehavior.floating,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8)),
+                  duration: const Duration(seconds: 2),
+                ));
               },
               icon: const Icon(Icons.copy_rounded, size: 15),
               label: const Text('Copy URL'),
@@ -767,13 +891,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         padding:
             const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
-          color: const Color(0xFF1E1E35),
-          borderRadius: BorderRadius.circular(6),
-        ),
+            color: const Color(0xFF1E1E35),
+            borderRadius: BorderRadius.circular(6)),
         child: Text(text,
-            style:
-                const TextStyle(color: Color(0xFF9090B0), fontSize: 12)),
-      );
+            style: const TextStyle(
+                color: Color(0xFF9090B0), fontSize: 12)));
 
   Widget _buildInfoCard(String text) => Container(
         padding: const EdgeInsets.all(14),
@@ -789,15 +911,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 color: Color(0xFF2AABEE), size: 16),
             const SizedBox(width: 10),
             Expanded(
-              child: Text(
-                text,
-                style: const TextStyle(
-                  color: Color(0xFF7070A0),
-                  fontSize: 12,
-                  height: 1.5,
-                ),
-              ),
-            ),
+                child: Text(text,
+                    style: const TextStyle(
+                        color: Color(0xFF7070A0),
+                        fontSize: 12,
+                        height: 1.5))),
           ],
         ),
       );
