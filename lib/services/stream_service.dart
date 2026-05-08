@@ -197,15 +197,15 @@ class StreamService extends ChangeNotifier {
 
   // ── Chunk fetcher ──────────────────────────────────────────────────────────
   //
-  // Uses TDLib's readFilePart which is the correct API for streaming:
-  //   - TDLib downloads exactly the requested byte range on demand
-  //   - Returns the bytes as base64 directly in the response
-  //   - Empty bytes = EOF (end of file), NOT a buffering delay
+  // downloadFile(synchronous:true) blocks until TDLib has the bytes locally.
+  // However, in rare cases TDLib returns downloaded_prefix_size=0 even with
+  // synchronous:true — this happens on the very first chunk when TDLib is
+  // still negotiating the DC connection. We retry up to 8 times with 500ms
+  // delay for that specific case (empty bytes from a non-EOF position).
   //
-  // NO retry loop — readFilePart blocks until the bytes are ready.
-  // The old retry logic was for downloadFile(synchronous:true) which is
-  // a different API with different semantics. Using it here caused the
-  // proxy to spin 15× on every EOF, serve 0 bytes, and libmpv to fail.
+  // null  = hard error (network down, invalid file_id) — stop streaming
+  // empty = either EOF or TDLib not ready yet — retry up to 8 times, then
+  //         treat as EOF if we're past the expected file size
 
   void _fetchChunks(
     int start,
@@ -220,39 +220,40 @@ class StreamService extends ChangeNotifier {
       try {
         while (true) {
           if (controller.isClosed) break;
-
-          // Stop if we have served the full requested range
           if (!unbounded && offset > end) break;
 
-          final remaining =
-              unbounded ? kChunkSize : (end - offset + 1);
+          final remaining = unbounded ? kChunkSize : (end - offset + 1);
           final count = remaining.clamp(1, kChunkSize);
 
-          final Uint8List? bytes =
-              await _telegramService!.downloadFilePart(
-            fileId: _activeFileId,
-            offset: offset,
-            count: count,
-          );
-
-          // null = TDLib error (network issue, invalid file, etc.)
-          if (bytes == null) {
+          Uint8List? bytes;
+          // Up to 8 retries for empty-but-not-EOF case
+          for (int attempt = 0; attempt < 8; attempt++) {
+            if (controller.isClosed) break;
+            bytes = await _telegramService!.downloadFilePart(
+              fileId: _activeFileId,
+              offset: offset,
+              count: count,
+            );
+            if (bytes == null) break;             // hard error — stop
+            if (bytes.isNotEmpty) break;           // got data — proceed
+            // empty: TDLib not ready or EOF — wait and retry
             debugPrint(
-                'StreamService: readFilePart returned null at offset=$offset, stopping');
-            break;
+                'StreamService: empty at offset=$offset attempt=$attempt');
+            await Future.delayed(const Duration(milliseconds: 500));
           }
 
-          // Empty bytes = EOF — readFilePart signals end of file this way
+          if (bytes == null) {
+            debugPrint('StreamService: null bytes at offset=$offset, stopping');
+            break;
+          }
           if (bytes.isEmpty) {
-            debugPrint(
-                'StreamService: EOF at offset=$offset');
+            debugPrint('StreamService: EOF at offset=$offset');
             break;
           }
 
           if (!controller.isClosed) {
             controller.add(bytes);
           }
-
           offset += bytes.length;
         }
       } catch (e, st) {
