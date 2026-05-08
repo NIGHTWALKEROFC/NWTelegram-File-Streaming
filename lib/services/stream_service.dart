@@ -1,24 +1,9 @@
 // lib/services/stream_service.dart
-//
-// FIXES:
-// ======
-// 1. autoCompress removed — gzip compression breaks video seeking in ExoPlayer.
-//
-// 2. Chunk fetching now uses TDLib's downloadFile (synchronous=true) correctly:
-//    - Retries up to 10 times when TDLib returns 0 bytes (buffering in progress)
-//    - 200 ms delay between retries so TDLib has time to buffer
-//    - This is the standard pattern for TDLib streaming in Flutter apps
-//
-// 3. Proper Content-Type handling — mime type is passed through unchanged so
-//    ExoPlayer picks the correct decoder (critical for .mkv, .ts etc.)
-//
-// 4. HEAD response always returns Accept-Ranges: bytes so ExoPlayer knows
-//    range requests are supported before it even tries to play.
-//
-// 5. Range parser handles suffix ranges (bytes=-500) correctly.
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
@@ -26,18 +11,11 @@ import 'package:shelf_router/shelf_router.dart';
 
 import 'telegram_service.dart';
 
-/// How many bytes to request from TDLib per chunk.
-/// 1 MB gives ExoPlayer enough to decode a few seconds ahead.
-const int kChunkSize = 1024 * 1024; // 1 MB
+// 512 KB per chunk — large enough for smooth playback, small enough that
+// readFilePart returns within the 90-second timeout on slow connections.
+const int kChunkSize = 512 * 1024;
 
-/// Local proxy port
 const int kProxyPort = 8484;
-
-/// How many times to retry when TDLib returns 0 bytes (still buffering)
-const int kMaxRetries = 15;
-
-/// Delay between retries
-const Duration kRetryDelay = Duration(milliseconds: 300);
 
 class StreamService extends ChangeNotifier {
   HttpServer? _server;
@@ -60,10 +38,8 @@ class StreamService extends ChangeNotifier {
     router.get('/ping', (Request req) => Response.ok('pong'));
     router.get('/stream', _handleStreamRequest);
     router.head('/stream', _handleHeadRequest);
-    router.options('/stream', (Request req) => Response.ok(
-      '',
-      headers: _corsHeaders(),
-    ));
+    router.options('/stream', (Request req) =>
+        Response.ok('', headers: _corsHeaders()));
 
     final handler = const Pipeline()
         .addMiddleware(_corsMiddleware())
@@ -72,9 +48,8 @@ class StreamService extends ChangeNotifier {
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
         _server = await shelf_io.serve(handler, '127.0.0.1', kProxyPort);
-        // DO NOT set autoCompress — gzip breaks video seeking
         _isRunning = true;
-        debugPrint('StreamService: proxy running on port $kProxyPort');
+        debugPrint('StreamService: proxy on port $kProxyPort');
         notifyListeners();
         return;
       } on SocketException catch (e) {
@@ -104,7 +79,8 @@ class StreamService extends ChangeNotifier {
     _activeFileId = fileId;
     _activeFileSize = fileSize;
     _activeMimeType = mimeType;
-    debugPrint('StreamService: active file=$fileId size=$fileSize mime=$mimeType');
+    debugPrint(
+        'StreamService: active file=$fileId size=$fileSize mime=$mimeType');
     notifyListeners();
   }
 
@@ -146,7 +122,7 @@ class StreamService extends ChangeNotifier {
 
     final rangeHeader = request.headers['range'];
 
-    // No file size at all — stream unbounded
+    // Unknown size — stream unbounded (readFilePart returns empty at EOF)
     if (fileSize <= 0) {
       if (rangeHeader != null) {
         return Response(416, headers: {'Content-Range': 'bytes */*'});
@@ -174,7 +150,8 @@ class StreamService extends ChangeNotifier {
     // Parse Range header
     final range = _parseRange(rangeHeader, fileSize);
     if (range == null) {
-      return Response(416, headers: {'Content-Range': 'bytes */$fileSize'});
+      return Response(416,
+          headers: {'Content-Range': 'bytes */$fileSize'});
     }
 
     final start = range.$1;
@@ -220,11 +197,15 @@ class StreamService extends ChangeNotifier {
 
   // ── Chunk fetcher ──────────────────────────────────────────────────────────
   //
-  // Uses TDLib downloadFile(synchronous:true) which blocks until the requested
-  // range is available locally, then reads from the local file.
+  // Uses TDLib's readFilePart which is the correct API for streaming:
+  //   - TDLib downloads exactly the requested byte range on demand
+  //   - Returns the bytes as base64 directly in the response
+  //   - Empty bytes = EOF (end of file), NOT a buffering delay
   //
-  // When TDLib returns 0 bytes it means it's still buffering — we retry up to
-  // kMaxRetries times with a short delay. This is the correct pattern.
+  // NO retry loop — readFilePart blocks until the bytes are ready.
+  // The old retry logic was for downloadFile(synchronous:true) which is
+  // a different API with different semantics. Using it here caused the
+  // proxy to spin 15× on every EOF, serve 0 bytes, and libmpv to fail.
 
   void _fetchChunks(
     int start,
@@ -240,31 +221,31 @@ class StreamService extends ChangeNotifier {
         while (true) {
           if (controller.isClosed) break;
 
-          // Stop if we've served the requested range
+          // Stop if we have served the full requested range
           if (!unbounded && offset > end) break;
 
-          final remaining = unbounded ? kChunkSize : (end - offset + 1);
+          final remaining =
+              unbounded ? kChunkSize : (end - offset + 1);
           final count = remaining.clamp(1, kChunkSize);
 
-          // Retry loop for when TDLib is buffering
-          Uint8List? bytes;
-          for (int retry = 0; retry < kMaxRetries; retry++) {
-            if (controller.isClosed) break;
-            bytes = await _telegramService!.downloadFilePart(
-              fileId: _activeFileId,
-              offset: offset,
-              count: count,
-            );
-            if (bytes != null && bytes.isNotEmpty) break;
-            // TDLib returned empty — still buffering, wait and retry
+          final Uint8List? bytes =
+              await _telegramService!.downloadFilePart(
+            fileId: _activeFileId,
+            offset: offset,
+            count: count,
+          );
+
+          // null = TDLib error (network issue, invalid file, etc.)
+          if (bytes == null) {
             debugPrint(
-                'StreamService: empty chunk at offset=$offset retry=$retry');
-            await Future.delayed(kRetryDelay);
+                'StreamService: readFilePart returned null at offset=$offset, stopping');
+            break;
           }
 
-          if (bytes == null || bytes.isEmpty) {
+          // Empty bytes = EOF — readFilePart signals end of file this way
+          if (bytes.isEmpty) {
             debugPrint(
-                'StreamService: giving up at offset=$offset after $kMaxRetries retries');
+                'StreamService: EOF at offset=$offset');
             break;
           }
 
@@ -273,9 +254,6 @@ class StreamService extends ChangeNotifier {
           }
 
           offset += bytes.length;
-
-          // Fewer bytes than requested = EOF
-          if (bytes.length < count && !unbounded) break;
         }
       } catch (e, st) {
         debugPrint('StreamService chunk error: $e\n$st');
@@ -290,7 +268,6 @@ class StreamService extends ChangeNotifier {
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   (int, int)? _parseRange(String header, int fileSize) {
-    // Standard: bytes=start-end  or  bytes=start-  or  bytes=-suffix
     final match = RegExp(r'bytes=(\d*)-(\d*)').firstMatch(header);
     if (match == null) return null;
 
@@ -301,7 +278,6 @@ class StreamService extends ChangeNotifier {
     int end;
 
     if (startStr.isEmpty && endStr.isNotEmpty) {
-      // Suffix range: bytes=-500 means last 500 bytes
       final suffix = int.tryParse(endStr) ?? 0;
       start = (fileSize - suffix).clamp(0, fileSize - 1);
       end = fileSize - 1;
