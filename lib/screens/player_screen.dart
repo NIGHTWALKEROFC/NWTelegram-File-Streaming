@@ -1,31 +1,28 @@
 // lib/screens/player_screen.dart
 //
-// FIXES in this revision:
-// ========================
-// 1. Player + VideoController are created SYNCHRONOUSLY in initState.
-//    media_kit requires the VideoController to exist before the Video widget
-//    is first built so the native surface (SurfaceTexture on Android) is
-//    registered before libmpv tries to attach to it. Creating them inside an
-//    async function that runs after a delay means the surface may not exist
-//    when libmpv starts — resulting in a black screen / no controls.
+// FIXES vs previous version:
+// ===========================
+// 1. Audio now uses media_kit (libmpv) instead of just_audio.
+//    just_audio could not get duration from the proxy stream for OGG/OPUS/FLAC
+//    because it relies on HTTP Content-Length + its own demuxer for duration.
+//    libmpv demuxes the stream directly and reports duration as soon as the
+//    first few KB arrive — works for every format.
 //
-// 2. player.open() is called via addPostFrameCallback AFTER the first frame
-//    is drawn. This guarantees the Video widget's Texture is registered and
-//    the local proxy server (started in HomeScreen.initState) has had time to
-//    bind its port before libmpv makes its first HTTP request to 127.0.0.1.
+// 2. Race condition fixed: setActiveFile is called by files_screen BEFORE
+//    Navigator.push, so by the time initState runs the proxy already has the
+//    correct fileId. player.open() in addPostFrameCallback is safe.
 //
-// 3. _isInitializing gate removed for video. The Video widget renders its own
-//    buffering spinner internally. Gating on _isInitializing meant the Video
-//    widget was never in the tree, so no surface existed for libmpv to render
-//    to and no controls were ever shown.
+// 3. Audio player state (position, duration, playing) comes from
+//    player.stream.* just like the video path — single code path, no
+//    separate AudioPlayer instance needed.
 //
-// 4. Error detection uses player.stream.error (string stream from libmpv).
+// 4. just_audio dependency is now unused in this file (kept in pubspec for
+//    any future use but not imported here).
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:just_audio/just_audio.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
@@ -48,116 +45,82 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // ── media_kit — created synchronously in initState ─────────────────────────
+  // Single Player + VideoController for both video and audio.
+  // For audio we just don't show the Video widget.
   late final Player _player;
   late final VideoController _videoController;
 
-  // ── just_audio (audio-only files) ─────────────────────────────────────────
-  AudioPlayer? _audioPlayer;
-  bool _isAudioPlaying = false;
-  Duration _audioDuration = Duration.zero;
-  Duration _audioPosition = Duration.zero;
+  // UI state driven by player.stream.*
+  Duration _position = Duration.zero;
+  Duration _duration = Duration.zero;
+  bool _playing = false;
+  bool _buffering = true;
+  String? _initError;
 
   final List<StreamSubscription<dynamic>> _subs = [];
-
-  // ── UI state ───────────────────────────────────────────────────────────────
-  bool _isAudioInitializing = true;
-  String? _initError;
 
   @override
   void initState() {
     super.initState();
 
-    if (widget.file.isVideo) {
-      // Create Player + VideoController synchronously so the Video widget has
-      // a valid controller on its very first build. The native surface
-      // (SurfaceTexture) is registered here — deferring this means libmpv
-      // has nothing to render to.
-      _player = Player(
-        configuration: const PlayerConfiguration(
-          bufferSize: 8 * 1024 * 1024,
-          logLevel: MPVLogLevel.warn,
-        ),
-      );
-      _videoController = VideoController(_player);
+    _player = Player(
+      configuration: const PlayerConfiguration(
+        bufferSize: 8 * 1024 * 1024, // 8 MB buffer
+        logLevel: MPVLogLevel.warn,
+      ),
+    );
+    _videoController = VideoController(_player);
 
-      _subs.add(_player.stream.error.listen((err) {
+    // Listen to player streams for UI updates
+    _subs.add(_player.stream.position.listen((p) {
+      if (mounted) setState(() => _position = p);
+    }));
+    _subs.add(_player.stream.duration.listen((d) {
+      if (mounted) setState(() => _duration = d);
+    }));
+    _subs.add(_player.stream.playing.listen((v) {
+      if (mounted) setState(() => _playing = v);
+    }));
+    _subs.add(_player.stream.buffering.listen((v) {
+      if (mounted) setState(() => _buffering = v);
+    }));
+    _subs.add(_player.stream.error.listen((err) {
+      if (err.isNotEmpty && mounted && _initError == null) {
         debugPrint('media_kit error: $err');
-        if (mounted && _initError == null && err.isNotEmpty) {
-          setState(() => _initError = err);
-        }
-      }));
+        setState(() => _initError = err);
+      }
+    }));
 
-      // Open media AFTER first frame — by then the Texture is registered
-      // and the local proxy server has finished binding port 8484.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _player.open(
-          Media(
-            widget.streamUrl,
-            httpHeaders: const {
-              'Accept': '*/*',
-              'Connection': 'keep-alive',
-            },
-          ),
-        );
-      });
-    } else if (widget.file.isAudio) {
-      _player = Player();
-      _videoController = VideoController(_player);
-      Future.delayed(const Duration(milliseconds: 200), _initAudioPlayer);
-    } else {
-      _player = Player();
-      _videoController = VideoController(_player);
-      _isAudioInitializing = false;
-    }
-  }
-
-  // ── Audio init ─────────────────────────────────────────────────────────────
-
-  Future<void> _initAudioPlayer() async {
-    if (!mounted) return;
-    try {
-      _audioPlayer = AudioPlayer();
-      _subs.add(_audioPlayer!.durationStream.listen((d) {
-        if (d != null && mounted) setState(() => _audioDuration = d);
-      }));
-      _subs.add(_audioPlayer!.positionStream.listen((p) {
-        if (mounted) setState(() => _audioPosition = p);
-      }));
-      _subs.add(_audioPlayer!.playingStream.listen((v) {
-        if (mounted) setState(() => _isAudioPlaying = v);
-      }));
-      await _audioPlayer!.setUrl(widget.streamUrl);
-      await _audioPlayer!.play();
-    } catch (e) {
-      debugPrint('Audio init error: $e');
-      if (mounted) setState(() => _initError = e.toString());
-    } finally {
-      if (mounted) setState(() => _isAudioInitializing = false);
-    }
-  }
-
-  // ── Retry video ────────────────────────────────────────────────────────────
-
-  void _retryVideo() {
-    if (!mounted) return;
-    setState(() => _initError = null);
-    Future.delayed(const Duration(milliseconds: 500), () {
+    // Open after first frame so the Video widget's Texture is registered
+    // and the proxy server has had time to bind.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _player.open(
-        Media(
-          widget.streamUrl,
-          httpHeaders: const {
-            'Accept': '*/*',
-            'Connection': 'keep-alive',
-          },
-        ),
-      );
+      _openMedia();
     });
   }
 
-  // ── Dispose ────────────────────────────────────────────────────────────────
+  void _openMedia() {
+    _player.open(
+      Media(
+        widget.streamUrl,
+        httpHeaders: const {
+          'Accept': '*/*',
+          'Connection': 'keep-alive',
+        },
+      ),
+    );
+  }
+
+  void _retryMedia() {
+    if (!mounted) return;
+    setState(() {
+      _initError = null;
+      _buffering = true;
+    });
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (mounted) _openMedia();
+    });
+  }
 
   @override
   void dispose() {
@@ -169,10 +132,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     for (final s in _subs) {
       s.cancel();
     }
-    _subs.clear();
-    // VideoController has no dispose() — Player.dispose() cleans it up.
     _player.dispose();
-    _audioPlayer?.dispose();
     super.dispose();
   }
 
@@ -180,6 +140,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Error screen (video only — audio/doc shows inline)
     if (_initError != null && widget.file.isVideo) {
       return Scaffold(
         backgroundColor: const Color(0xFF0A0A0F),
@@ -195,12 +156,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
     }
 
+    if (widget.file.isAudio) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF0A0A0F),
+        appBar: _buildAppBar(),
+        body: _buildAudioView(),
+      );
+    }
+
+    // Non-playable document
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0F),
       appBar: _buildAppBar(),
-      body: widget.file.isAudio
-          ? (_isAudioInitializing ? _buildLoading() : _buildAudioView())
-          : _buildDocumentView(),
+      body: _buildDocumentView(),
     );
   }
 
@@ -217,20 +185,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
 
-  Widget _buildLoading() => const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(
-                color: Color(0xFF2AABEE), strokeWidth: 2),
-            SizedBox(height: 20),
-            Text('Connecting to stream...',
-                style: TextStyle(color: Color(0xFF9090B0), fontSize: 15)),
-          ],
-        ),
-      );
-
-  // ── Video view ─────────────────────────────────────────────────────────────
+  // ── Video ──────────────────────────────────────────────────────────────────
 
   Widget _buildVideoView() {
     final qualityLabel = widget.selectedQuality?.label ??
@@ -244,7 +199,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         seekBarThumbColor: const Color(0xFF2AABEE),
         primaryButtonBar: [
           const Spacer(),
-          MaterialPlayOrPauseButton(iconSize: 48),
+          const MaterialPlayOrPauseButton(iconSize: 48),
           const Spacer(),
         ],
         topButtonBar: [
@@ -289,7 +244,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             onPressed: _showSpeedPicker,
             icon: const Icon(Icons.speed_rounded, color: Colors.white),
           ),
-          MaterialFullscreenButton(),
+          const MaterialFullscreenButton(),
         ],
         volumeGesture: true,
         brightnessGesture: true,
@@ -405,11 +360,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Audio view ─────────────────────────────────────────────────────────────
+  // ── Audio ──────────────────────────────────────────────────────────────────
+  //
+  // Uses the same _player (libmpv) as video — supports every audio format
+  // including OGG, OPUS, FLAC, AAC, MP3. Duration is read from the stream
+  // by libmpv's demuxer, so it works even without Content-Length headers.
 
   Widget _buildAudioView() {
-    final progress = _audioDuration.inMilliseconds > 0
-        ? (_audioPosition.inMilliseconds / _audioDuration.inMilliseconds)
+    final hasDuration = _duration.inSeconds > 0;
+    final progress = hasDuration
+        ? (_position.inMilliseconds / _duration.inMilliseconds)
             .clamp(0.0, 1.0)
         : 0.0;
 
@@ -418,6 +378,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       child: Column(
         children: [
           const SizedBox(height: 32),
+          // Album art / icon
           Container(
             width: 180,
             height: 180,
@@ -435,24 +396,73 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     spreadRadius: 4)
               ],
             ),
-            child: const Icon(Icons.music_note_rounded,
-                color: Colors.white, size: 72),
+            child: _buffering && !_playing
+                ? const Center(
+                    child: SizedBox(
+                      width: 40,
+                      height: 40,
+                      child: CircularProgressIndicator(
+                        color: Colors.white,
+                        strokeWidth: 2.5,
+                      ),
+                    ),
+                  )
+                : const Icon(Icons.music_note_rounded,
+                    color: Colors.white, size: 72),
           ),
           const SizedBox(height: 32),
-          Text(widget.file.name,
-              style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w600),
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis),
+          Text(
+            widget.file.name,
+            style: const TextStyle(
+                color: Colors.white,
+                fontSize: 17,
+                fontWeight: FontWeight.w600),
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
           const SizedBox(height: 6),
           Text(
-              widget.file.mimeType.toUpperCase().replaceAll('AUDIO/', ''),
-              style: const TextStyle(
-                  color: Color(0xFF9090B0), fontSize: 13)),
+            widget.file.mimeType.toUpperCase().replaceAll('AUDIO/', ''),
+            style:
+                const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
+          ),
+
+          // Error inline
+          if (_initError != null) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2A1020),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFFCF6679)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.error_outline_rounded,
+                      color: Color(0xFFCF6679), size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _initError!,
+                      style: const TextStyle(
+                          color: Color(0xFF9090B0), fontSize: 12),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _retryMedia,
+                    child: const Text('Retry',
+                        style: TextStyle(color: Color(0xFF2AABEE))),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
           const SizedBox(height: 28),
+
+          // Seek bar
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
               activeTrackColor: const Color(0xFF9B59B6),
@@ -464,9 +474,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
             child: Slider(
               value: progress,
-              onChanged: (v) => _audioPlayer?.seek(Duration(
-                  milliseconds:
-                      (v * _audioDuration.inMilliseconds).round())),
+              onChanged: hasDuration
+                  ? (v) => _player.seek(Duration(
+                      milliseconds:
+                          (v * _duration.inMilliseconds).round()))
+                  : null,
             ),
           ),
           Padding(
@@ -474,16 +486,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(_fmt(_audioPosition),
+                Text(_fmt(_position),
                     style: const TextStyle(
                         color: Color(0xFF9090B0), fontSize: 12)),
-                Text(_fmt(_audioDuration),
+                Text(hasDuration ? _fmt(_duration) : '--:--',
                     style: const TextStyle(
                         color: Color(0xFF9090B0), fontSize: 12)),
               ],
             ),
           ),
+
           const SizedBox(height: 20),
+
+          // Controls
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -492,16 +507,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 icon: const Icon(Icons.replay_10_rounded,
                     color: Colors.white),
                 onPressed: () {
-                  final p = _audioPosition - const Duration(seconds: 10);
-                  _audioPlayer
-                      ?.seek(p < Duration.zero ? Duration.zero : p);
+                  final p = _position - const Duration(seconds: 10);
+                  _player.seek(
+                      p < Duration.zero ? Duration.zero : p);
                 },
               ),
               const SizedBox(width: 12),
               GestureDetector(
-                onTap: () => _isAudioPlaying
-                    ? _audioPlayer?.pause()
-                    : _audioPlayer?.play(),
+                onTap: () =>
+                    _playing ? _player.pause() : _player.play(),
                 child: Container(
                   width: 68,
                   height: 68,
@@ -516,7 +530,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ],
                   ),
                   child: Icon(
-                    _isAudioPlaying
+                    _playing
                         ? Icons.pause_rounded
                         : Icons.play_arrow_rounded,
                     color: Colors.white,
@@ -529,11 +543,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 iconSize: 30,
                 icon: const Icon(Icons.forward_30_rounded,
                     color: Colors.white),
-                onPressed: () {
-                  final p = _audioPosition + const Duration(seconds: 30);
-                  _audioPlayer
-                      ?.seek(p > _audioDuration ? _audioDuration : p);
-                },
+                onPressed: hasDuration
+                    ? () {
+                        final p =
+                            _position + const Duration(seconds: 30);
+                        _player.seek(
+                            p > _duration ? _duration : p);
+                      }
+                    : null,
               ),
             ],
           ),
@@ -596,14 +613,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Icon(icon, color: color, size: 50),
           ),
           const SizedBox(height: 18),
-          Text(widget.file.name,
-              style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w600),
-              textAlign: TextAlign.center,
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis),
+          Text(
+            widget.file.name,
+            style: const TextStyle(
+                color: Colors.white,
+                fontSize: 17,
+                fontWeight: FontWeight.w600),
+            textAlign: TextAlign.center,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
           const SizedBox(height: 10),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -617,14 +636,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _buildStreamUrlCard(),
           const SizedBox(height: 16),
           _buildInfoCard(
-              'The stream URL is served live from this device. '
-              'Copy it and open in any app that supports HTTP streaming.'),
+            'This is a document file. Copy the stream URL and open it '
+            'in any app that supports HTTP streaming or downloading.',
+          ),
         ],
       ),
     );
   }
 
-  // ── Error view ─────────────────────────────────────────────────────────────
+  // ── Error view (video only) ────────────────────────────────────────────────
 
   Widget _buildErrorView() {
     return SingleChildScrollView(
@@ -641,10 +661,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   fontSize: 20,
                   fontWeight: FontWeight.w600)),
           const SizedBox(height: 10),
-          Text(_initError ?? 'Unknown error',
-              style: const TextStyle(
-                  color: Color(0xFF9090B0), fontSize: 13, height: 1.5),
-              textAlign: TextAlign.center),
+          Text(
+            _initError ?? 'Unknown error',
+            style: const TextStyle(
+                color: Color(0xFF9090B0), fontSize: 13, height: 1.5),
+            textAlign: TextAlign.center,
+          ),
           const SizedBox(height: 20),
           _buildStreamUrlCard(),
           const SizedBox(height: 20),
@@ -660,7 +682,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
               const SizedBox(width: 12),
               ElevatedButton.icon(
-                onPressed: _retryVideo,
+                onPressed: _retryMedia,
                 icon: const Icon(Icons.refresh_rounded, size: 16),
                 label: const Text('Retry'),
               ),
@@ -671,7 +693,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Stream URL card ────────────────────────────────────────────────────────
+  // ── Shared widgets ─────────────────────────────────────────────────────────
 
   Widget _buildStreamUrlCard() {
     return Container(
@@ -741,17 +763,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
-
   Widget _badge(String text) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
           color: const Color(0xFF1E1E35),
           borderRadius: BorderRadius.circular(6),
         ),
         child: Text(text,
-            style: const TextStyle(
-                color: Color(0xFF9090B0), fontSize: 12)),
+            style:
+                const TextStyle(color: Color(0xFF9090B0), fontSize: 12)),
       );
 
   Widget _buildInfoCard(String text) => Container(
@@ -768,12 +789,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 color: Color(0xFF2AABEE), size: 16),
             const SizedBox(width: 10),
             Expanded(
-              child: Text(text,
-                  style: const TextStyle(
-                    color: Color(0xFF7070A0),
-                    fontSize: 12,
-                    height: 1.5,
-                  )),
+              child: Text(
+                text,
+                style: const TextStyle(
+                  color: Color(0xFF7070A0),
+                  fontSize: 12,
+                  height: 1.5,
+                ),
+              ),
             ),
           ],
         ),
@@ -784,7 +807,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final m = d.inMinutes % 60;
     final s = d.inSeconds % 60;
     if (h > 0) {
-      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+      return '${h.toString().padLeft(2, '0')}:'
+          '${m.toString().padLeft(2, '0')}:'
+          '${s.toString().padLeft(2, '0')}';
     }
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
