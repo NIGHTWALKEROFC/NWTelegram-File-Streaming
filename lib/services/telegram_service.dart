@@ -685,22 +685,22 @@ class TelegramService extends ChangeNotifier {
     return (f?['local'] as Map<String, dynamic>?)?['path'] as String?;
   }
 
-  // ── Streaming — readFilePart (correct TDLib streaming API) ────────────────
+  // ── Streaming: downloadFile(synchronous:true) + read local file ───────────
   //
-  // WHY readFilePart instead of downloadFile(synchronous:true):
+  // HOW TDLIB STREAMING WORKS:
   //
-  // downloadFile(synchronous:true) requires an active partial download to
-  // already exist for the file. Files discovered via searchChatMessages have
-  // a file_id but no active download — downloaded_prefix_size=0, path=''.
-  // This makes the proxy return 0 bytes, and libmpv fails with:
-  // "failed to open http://127.0.0.1:8484/stream"
+  // readFilePart only reads bytes already in local cache — does NOT fetch
+  // from Telegram servers. On a fresh file it returns error immediately.
   //
-  // readFilePart is the correct TDLib streaming API:
-  //   • Accepts file_id + offset + count
-  //   • TDLib downloads exactly the requested range automatically
-  //   • Returns the bytes directly as base64 in the response
-  //   • No local file path needed, no manual file reading
-  //   • This is exactly how official Telegram clients stream files
+  // Correct approach (what all Telegram clients do):
+  //   1. downloadFile(offset, limit, priority=32, synchronous=true)
+  //      TDLib fetches exactly [offset..offset+limit] from Telegram servers,
+  //      blocks until those bytes are locally available, returns File object
+  //      with local.path and local.downloaded_prefix_size.
+  //   2. Read bytes from the local file at [offset..offset+available].
+  //
+  // This is called once per 512KB chunk by stream_service.dart.
+  // No retry loop needed — synchronous:true handles the waiting.
 
   Future<Uint8List?> downloadFilePart({
     required int fileId,
@@ -708,38 +708,79 @@ class TelegramService extends ChangeNotifier {
     required int count,
   }) async {
     try {
+      debugPrint('TG.downloadFilePart fileId=$fileId offset=$offset count=$count');
+
       final res = await _request(
         {
-          '@type': 'readFilePart',
+          '@type': 'downloadFile',
           'file_id': fileId,
+          'priority': 32,
           'offset': offset,
-          'count': count,
+          'limit': count,
+          'synchronous': true,
         },
-        // readFilePart may take several seconds on the first call while
-        // TDLib fetches the bytes from Telegram's servers.
-        timeout: const Duration(seconds: 90),
+        timeout: const Duration(seconds: 120),
       );
 
-      if (res == null || res['@type'] == 'error') {
-        debugPrint(
-            'readFilePart error: ${res?['message']} at offset=$offset');
+      if (res == null) {
+        debugPrint('TG.downloadFilePart: null response at offset=$offset');
+        return null;
+      }
+      if (res['@type'] == 'error') {
+        debugPrint('TG.downloadFilePart: error "${res['message']}" code=${res['code']} at offset=$offset');
         return null;
       }
 
-      // TDLib returns base64-encoded bytes in the 'data' field
-      final base64Data = res['data'] as String?;
-      if (base64Data == null || base64Data.isEmpty) {
-        // Empty data = EOF (end of file reached)
+      final local = res['local'] as Map<String, dynamic>?;
+      if (local == null) {
+        debugPrint('TG.downloadFilePart: no local object');
+        return null;
+      }
+
+      final path = local['path'] as String? ?? '';
+      final prefixSize = local['downloaded_prefix_size'] as int? ?? 0;
+      final isComplete = local['is_downloading_completed'] as bool? ?? false;
+
+      debugPrint('TG.downloadFilePart: path=$path prefix=$prefixSize complete=$isComplete');
+
+      if (path.isEmpty) {
+        debugPrint('TG.downloadFilePart: empty path — TDLib did not create local file yet');
+        return null;
+      }
+
+      final file = io.File(path);
+      if (!await file.exists()) {
+        debugPrint('TG.downloadFilePart: file missing on disk: $path');
+        return null;
+      }
+
+      final fileLen = await file.length();
+
+      // How many bytes are available from our offset?
+      final available = isComplete
+          ? (fileLen - offset).clamp(0, count)
+          : (prefixSize - offset).clamp(0, count);
+
+      debugPrint('TG.downloadFilePart: fileLen=$fileLen available=$available');
+
+      if (available <= 0) {
+        // downloaded_prefix_size <= offset means nothing available yet
+        // Return empty = EOF signal to stream_service
         return Uint8List(0);
       }
 
-      return base64Decode(base64Data);
+      final raf = await file.open();
+      try {
+        await raf.setPosition(offset);
+        return await raf.read(available);
+      } finally {
+        await raf.close();
+      }
     } catch (e, st) {
-      debugPrint('downloadFilePart error: $e\n$st');
+      debugPrint('TG.downloadFilePart error: $e\n$st');
       return null;
     }
   }
-
   Future<int> getFileSize(int fileId) async {
     try {
       final res = await _request({'@type': 'getFile', 'file_id': fileId});
