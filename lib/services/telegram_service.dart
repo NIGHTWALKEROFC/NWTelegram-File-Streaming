@@ -792,6 +792,34 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
+  // ── Pre-warm: establish CDN connection before first chunk ─────────────────
+  //
+  // TDLib needs to auth with Telegram's CDN before any bytes can be fetched.
+  // This call downloads just 1 byte synchronously — fast (usually <2s) —
+  // and establishes the session so subsequent chunk requests are instant.
+  // Call this in _playFile before Navigator.push so by the time the player
+  // makes its first HTTP request the CDN session is already active.
+
+  Future<void> prewarmFile(int fileId) async {
+    try {
+      debugPrint('TG.prewarmFile fileId=$fileId');
+      await _request(
+        {
+          '@type': 'downloadFile',
+          'file_id': fileId,
+          'priority': 32,
+          'offset': 0,
+          'limit': 1,
+          'synchronous': true,
+        },
+        timeout: const Duration(seconds: 30),
+      );
+      debugPrint('TG.prewarmFile done');
+    } catch (e) {
+      debugPrint('TG.prewarmFile error (non-fatal): $e');
+    }
+  }
+
   // ── Low level ──────────────────────────────────────────────────────────────
 
   void _send(Map<String, dynamic> req) {
