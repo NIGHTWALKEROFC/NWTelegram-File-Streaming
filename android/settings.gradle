@@ -18,8 +18,13 @@ pluginManagement {
 
 plugins {
     id "dev.flutter.flutter-plugin-loader" version "1.0.0"
-    id "com.android.application" version "8.9.1" apply false  // ← bumped from 8.6.0
-    id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+    id "com.android.application" version "8.9.1" apply false
+    // ✅ FIX: Bumped from 2.1.0 → 2.3.20 so that screen_brightness_android
+    //         (and any other plugin compiled with kotlin-stdlib 2.3.x) is
+    //         compatible with the host Kotlin compiler. The build error was:
+    //         "Module was compiled with an incompatible version of Kotlin.
+    //          The binary version of its metadata is 2.3.0, expected 2.1.0."
+    id "org.jetbrains.kotlin.android" version "2.3.20" apply false
 }
 
 include ":app"
