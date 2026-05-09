@@ -6,6 +6,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import 'package:path_provider/path_provider.dart';
+
 import '../models/telegram_file.dart';
 import '../services/telegram_service.dart';
 import '../services/stream_service.dart';
@@ -25,8 +27,8 @@ class _FilesScreenState extends State<FilesScreen>
   bool _isLoading = true;
   bool _hasData = false;
   String? _loadError;
-
   StreamSubscription<List<TelegramFile>>? _fileSub;
+  String _cacheSize = '';   // shown in appbar actions
 
   int _tabIndex = 0;
   final TextEditingController _searchController = TextEditingController();
@@ -45,7 +47,10 @@ class _FilesScreenState extends State<FilesScreen>
       _applyFilter();
     });
     _searchController.addListener(_applyFilter);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _startLoading());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _startLoading();
+      _loadCacheSize();
+    });
   }
 
   @override
@@ -66,6 +71,8 @@ class _FilesScreenState extends State<FilesScreen>
       _hasData = false;
       _loadError = null;
     });
+    // Refresh cache size each time we reload
+    _loadCacheSize();
 
     final svc = context.read<TelegramService>();
     _fileSub = svc.streamAllMediaFiles(limitPerChat: 30).listen(
@@ -91,28 +98,113 @@ class _FilesScreenState extends State<FilesScreen>
     );
   }
 
+  // ── Cache helpers ──────────────────────────────────────────────────────────
+
+  Future<void> _loadCacheSize() async {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final filesDir = Directory('${appDir.path}/tdlib_files');
+      if (!await filesDir.exists()) {
+        if (mounted) setState(() => _cacheSize = '0 B');
+        return;
+      }
+      int total = 0;
+      await for (final entity in filesDir.list(recursive: true)) {
+        if (entity is File) {
+          total += await entity.length();
+        }
+      }
+      if (mounted) setState(() => _cacheSize = _fmtBytes(total));
+    } catch (e) {
+      if (mounted) setState(() => _cacheSize = '');
+    }
+  }
+
+  Future<void> _clearCache() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF141420),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16)),
+        title: const Text('Clear Cache',
+            style: TextStyle(color: Colors.white)),
+        content: Text(
+          'This will delete all locally cached files '
+          '(${_cacheSize.isNotEmpty ? _cacheSize : "calculating..."}). '
+          'Files remain safe on Telegram servers.',
+          style: const TextStyle(color: Color(0xFF9090B0), height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Clear',
+                style: TextStyle(
+                    color: Color(0xFFCF6679),
+                    fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true || !mounted) return;
+
+    // Show progress
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('Clearing cache...'),
+      backgroundColor: Color(0xFF1A1A2E),
+      duration: Duration(seconds: 10),
+      behavior: SnackBarBehavior.floating,
+    ));
+
+    await context.read<TelegramService>().clearAllCache();
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: const Text('Cache cleared!'),
+      backgroundColor: const Color(0xFF27AE60),
+      behavior: SnackBarBehavior.floating,
+      shape:
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      duration: const Duration(seconds: 2),
+    ));
+
+    await _loadCacheSize();
+  }
+
+  String _fmtBytes(int bytes) {
+    if (bytes <= 0) return '0 B';
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
   void _applyFilter() {
     final query = _searchController.text.trim().toLowerCase();
     List<TelegramFile> result = List.of(_allFiles);
     switch (_tabIndex) {
-      case 1:
-        result = result.where((f) => f.isVideo).toList();
-        break;
-      case 2:
-        result = result.where((f) => f.isAudio).toList();
-        break;
-      case 3:
-        result = result.where((f) => f.isDocument).toList();
-        break;
+      case 1: result = result.where((f) => f.isVideo).toList(); break;
+      case 2: result = result.where((f) => f.isAudio).toList(); break;
+      case 3: result = result.where((f) => f.isDocument).toList(); break;
     }
     if (query.isNotEmpty) {
-      result =
-          result.where((f) => f.name.toLowerCase().contains(query)).toList();
+      result = result
+          .where((f) => f.name.toLowerCase().contains(query))
+          .toList();
     }
     setState(() => _filtered = result);
   }
 
-  // ── Play ───────────────────────────────────────────────────────────────────
+  // ── Play a file ────────────────────────────────────────────────────────────
 
   Future<void> _playFile(TelegramFile file) async {
     final streamSvc = context.read<StreamService>();
@@ -122,68 +214,69 @@ class _FilesScreenState extends State<FilesScreen>
       await streamSvc.startServer(telegramSvc);
     }
 
-    // For video with multiple qualities: start with lowest quality for fast
-    // initial load. Player shows a quality picker to switch manually.
-    // For video with one quality, or audio/doc: use the only fileId.
+    // For video with multiple qualities: start with lowest (fastest to load).
+    // Player offers manual picker to switch up.
+    // For single-quality video / audio / doc: use the file's own fileId.
     VideoQuality? initialQuality;
-    if (file.isVideo && file.qualities.isNotEmpty) {
-      // Pick lowest quality for auto-start (fastest to load)
-      initialQuality = file.qualities.last;
+    if (file.isVideo && file.qualities.length > 1) {
+      initialQuality = file.qualities.last; // lowest = fastest
+    } else if (file.isVideo && file.qualities.length == 1) {
+      initialQuality = file.qualities.first;
     }
 
     final int fileId = initialQuality?.fileId ?? file.fileId;
     final int fileSize = initialQuality?.fileSize ?? file.fileSize;
 
-    // Show loading snackbar
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Row(
-            children: [
-              SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.white,
-                ),
-              ),
-              SizedBox(width: 12),
-              Text('Preparing stream...'),
-            ],
-          ),
-          backgroundColor: const Color(0xFF1A1A2E),
-          duration: const Duration(seconds: 8),
-          behavior: SnackBarBehavior.floating,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        ),
-      );
-    }
-
-    // Pre-warm: establish CDN session before the player opens.
-    // This prevents the "playback error" on first play.
-    await telegramSvc.prewarmFile(fileId);
-
+    // Show "Preparing…" while download starts
     if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: const Row(children: [
+        SizedBox(
+          width: 16, height: 16,
+          child: CircularProgressIndicator(
+              strokeWidth: 2, color: Colors.white),
+        ),
+        SizedBox(width: 12),
+        Text('Preparing stream...'),
+      ]),
+      backgroundColor: const Color(0xFF1A1A2E),
+      duration: const Duration(seconds: 30),
+      behavior: SnackBarBehavior.floating,
+      shape:
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    ));
 
-    streamSvc.setActiveFile(
+    // Start the background download — TDLib begins fetching immediately.
+    // prepareFile returns as soon as TDLib acknowledges the request (~1s).
+    final ok = await streamSvc.prepareFile(
       fileId: fileId,
       fileSize: fileSize,
       mimeType: file.mimeType,
     );
 
     if (!mounted) return;
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => PlayerScreen(
-          file: file,
-          initialQuality: initialQuality,
-          streamUrl: streamSvc.streamUrl,
-        ),
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: const Text('Failed to start download. Check connection.'),
+        backgroundColor: const Color(0xFFCF6679),
+        behavior: SnackBarBehavior.floating,
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        duration: const Duration(seconds: 3),
+      ));
+      return;
+    }
+
+    if (!mounted) return;
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PlayerScreen(
+        file: file,
+        initialQuality: initialQuality,
+        streamUrl: streamSvc.streamUrl,
       ),
-    );
+    ));
   }
 
   // ── Build ──────────────────────────────────────────────────────────────────
@@ -209,129 +302,149 @@ class _FilesScreenState extends State<FilesScreen>
     );
   }
 
-  PreferredSizeWidget _buildAppBar() {
-    return AppBar(
-      backgroundColor: const Color(0xFF0A0A0F),
-      elevation: 0,
-      title: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 28,
-            height: 28,
-            decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                  colors: [Color(0xFF2AABEE), Color(0xFF1A7FBF)]),
-              borderRadius: BorderRadius.circular(8),
+  PreferredSizeWidget _buildAppBar() => AppBar(
+        backgroundColor: const Color(0xFF0A0A0F),
+        elevation: 0,
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 28, height: 28,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                    colors: [Color(0xFF2AABEE), Color(0xFF1A7FBF)]),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.play_arrow_rounded,
+                  color: Colors.white, size: 18),
             ),
-            child: const Icon(Icons.play_arrow_rounded,
-                color: Colors.white, size: 18),
+            const SizedBox(width: 8),
+            const Text('TG Streamer',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600)),
+          ],
+        ),
+        actions: [
+          // Cache size badge + clear button
+          if (_cacheSize.isNotEmpty && _cacheSize != '0 B')
+            GestureDetector(
+              onTap: _clearCache,
+              child: Container(
+                margin: const EdgeInsets.only(right: 4),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2A1010),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                      color: const Color(0xFFCF6679).withOpacity(0.5)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.delete_outline_rounded,
+                        color: Color(0xFFCF6679), size: 13),
+                    const SizedBox(width: 4),
+                    Text(_cacheSize,
+                        style: const TextStyle(
+                            color: Color(0xFFCF6679),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+              ),
+            ),
+          if (_allFiles.isNotEmpty)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Text('${_allFiles.length} files',
+                    style: const TextStyle(
+                        color: Color(0xFF5070A0), fontSize: 12)),
+              ),
+            ),
+          IconButton(
+            icon: const Icon(Icons.refresh_rounded, color: Colors.white),
+            onPressed: _isLoading ? null : _startLoading,
           ),
-          const SizedBox(width: 8),
-          const Text('TG Streamer',
-              style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600)),
+          IconButton(
+            icon: const Icon(Icons.logout_rounded, color: Colors.white),
+            onPressed: _confirmLogout,
+          ),
         ],
-      ),
-      actions: [
-        if (_allFiles.isNotEmpty)
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Text('${_allFiles.length} files',
-                  style: const TextStyle(
-                      color: Color(0xFF5070A0), fontSize: 12)),
+      );
+
+  Widget _buildSearchBar() => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        child: Container(
+          height: 46,
+          decoration: BoxDecoration(
+            color: const Color(0xFF141420),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: _searchFocus.hasFocus
+                  ? const Color(0xFF2AABEE)
+                  : const Color(0xFF2A2A40),
+              width: 1.5,
             ),
           ),
-        IconButton(
-          icon: const Icon(Icons.refresh_rounded, color: Colors.white),
-          tooltip: 'Refresh',
-          onPressed: _isLoading ? null : _startLoading,
+          child: TextField(
+            controller: _searchController,
+            focusNode: _searchFocus,
+            style: const TextStyle(color: Colors.white, fontSize: 14),
+            decoration: InputDecoration(
+              hintText: 'Search files...',
+              hintStyle: const TextStyle(
+                  color: Color(0xFF606080), fontSize: 14),
+              prefixIcon: const Icon(Icons.search_rounded,
+                  color: Color(0xFF2AABEE), size: 20),
+              suffixIcon: _searchController.text.isNotEmpty
+                  ? IconButton(
+                      icon: const Icon(Icons.clear_rounded,
+                          color: Color(0xFF606080), size: 18),
+                      onPressed: () {
+                        _searchController.clear();
+                        _searchFocus.unfocus();
+                      },
+                    )
+                  : null,
+              border: InputBorder.none,
+              enabledBorder: InputBorder.none,
+              focusedBorder: InputBorder.none,
+              contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16, vertical: 14),
+            ),
+          ),
         ),
-        IconButton(
-          icon: const Icon(Icons.logout_rounded, color: Colors.white),
-          tooltip: 'Logout',
-          onPressed: _confirmLogout,
-        ),
-      ],
-    );
-  }
+      );
 
-  Widget _buildSearchBar() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      child: Container(
-        height: 46,
+  Widget _buildTabBar() => Container(
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        height: 38,
         decoration: BoxDecoration(
           color: const Color(0xFF141420),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: _searchFocus.hasFocus
-                ? const Color(0xFF2AABEE)
-                : const Color(0xFF2A2A40),
-            width: 1.5,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: TabBar(
+          controller: _tabController,
+          indicator: BoxDecoration(
+            color: const Color(0xFF2AABEE),
+            borderRadius: BorderRadius.circular(8),
           ),
+          indicatorSize: TabBarIndicatorSize.tab,
+          dividerColor: Colors.transparent,
+          labelColor: Colors.white,
+          unselectedLabelColor: const Color(0xFF7070A0),
+          labelStyle: const TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w600),
+          unselectedLabelStyle: const TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w500),
+          padding: const EdgeInsets.all(3),
+          tabs: _tabs.map((t) => Tab(text: t, height: 32)).toList(),
         ),
-        child: TextField(
-          controller: _searchController,
-          focusNode: _searchFocus,
-          style: const TextStyle(color: Colors.white, fontSize: 14),
-          decoration: InputDecoration(
-            hintText: 'Search files...',
-            hintStyle:
-                const TextStyle(color: Color(0xFF606080), fontSize: 14),
-            prefixIcon: const Icon(Icons.search_rounded,
-                color: Color(0xFF2AABEE), size: 20),
-            suffixIcon: _searchController.text.isNotEmpty
-                ? IconButton(
-                    icon: const Icon(Icons.clear_rounded,
-                        color: Color(0xFF606080), size: 18),
-                    onPressed: () {
-                      _searchController.clear();
-                      _searchFocus.unfocus();
-                    },
-                  )
-                : null,
-            border: InputBorder.none,
-            enabledBorder: InputBorder.none,
-            focusedBorder: InputBorder.none,
-            contentPadding:
-                const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildTabBar() {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-      height: 38,
-      decoration: BoxDecoration(
-        color: const Color(0xFF141420),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: TabBar(
-        controller: _tabController,
-        indicator: BoxDecoration(
-          color: const Color(0xFF2AABEE),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        indicatorSize: TabBarIndicatorSize.tab,
-        dividerColor: Colors.transparent,
-        labelColor: Colors.white,
-        unselectedLabelColor: const Color(0xFF7070A0),
-        labelStyle:
-            const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-        unselectedLabelStyle:
-            const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
-        padding: const EdgeInsets.all(3),
-        tabs: _tabs.map((t) => Tab(text: t, height: 32)).toList(),
-      ),
-    );
-  }
+      );
 
   Widget _buildBody() {
     if (_isLoading && !_hasData) return _buildInitialLoading();
@@ -341,22 +454,23 @@ class _FilesScreenState extends State<FilesScreen>
     return _buildFileList();
   }
 
-  Widget _buildInitialLoading() => Center(
+  Widget _buildInitialLoading() => const Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
-          children: const [
+          children: [
             SizedBox(
-              width: 36,
-              height: 36,
+              width: 36, height: 36,
               child: CircularProgressIndicator(
                   color: Color(0xFF2AABEE), strokeWidth: 2.5),
             ),
             SizedBox(height: 20),
             Text('Scanning your chats...',
-                style: TextStyle(color: Color(0xFF9090B0), fontSize: 15)),
+                style: TextStyle(
+                    color: Color(0xFF9090B0), fontSize: 15)),
             SizedBox(height: 8),
             Text('Files will appear as they are found',
-                style: TextStyle(color: Color(0xFF5050A0), fontSize: 12)),
+                style: TextStyle(
+                    color: Color(0xFF5050A0), fontSize: 12)),
           ],
         ),
       );
@@ -396,12 +510,10 @@ class _FilesScreenState extends State<FilesScreen>
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Container(
-              width: 72,
-              height: 72,
+              width: 72, height: 72,
               decoration: BoxDecoration(
-                color: const Color(0xFF141420),
-                borderRadius: BorderRadius.circular(20),
-              ),
+                  color: const Color(0xFF141420),
+                  borderRadius: BorderRadius.circular(20)),
               child: const Icon(Icons.folder_open_rounded,
                   color: Color(0xFF3A3A6A), size: 36),
             ),
@@ -455,31 +567,25 @@ class _FilesScreenState extends State<FilesScreen>
             if (_isLoading) ...[
               const SizedBox(height: 16),
               const Text('Still scanning — more may appear shortly',
-                  style:
-                      TextStyle(color: Color(0xFF5050A0), fontSize: 12)),
+                  style: TextStyle(
+                      color: Color(0xFF5050A0), fontSize: 12)),
             ],
           ],
         ),
       );
 
-  Widget _buildFileList() {
-    return RefreshIndicator(
-      color: const Color(0xFF2AABEE),
-      backgroundColor: const Color(0xFF141420),
-      onRefresh: () async => _startLoading(),
-      child: ListView.builder(
-        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
-        itemCount: _filtered.length,
-        itemBuilder: (context, index) =>
-            _buildFileCard(_filtered[index]),
-      ),
-    );
-  }
+  Widget _buildFileList() => RefreshIndicator(
+        color: const Color(0xFF2AABEE),
+        backgroundColor: const Color(0xFF141420),
+        onRefresh: () async => _startLoading(),
+        child: ListView.builder(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+          itemCount: _filtered.length,
+          itemBuilder: (ctx, i) => _buildFileCard(_filtered[i]),
+        ),
+      );
 
   Widget _buildFileCard(TelegramFile file) {
-    final iconData = _iconFor(file);
-    final iconColor = _colorFor(file);
-
     return GestureDetector(
       onTap: () => _playFile(file),
       child: Container(
@@ -492,23 +598,21 @@ class _FilesScreenState extends State<FilesScreen>
         ),
         child: Row(
           children: [
-            _buildThumbOrIcon(file, iconData, iconColor),
+            _buildThumbOrIcon(file),
             const SizedBox(width: 14),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    file.name,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
-                      height: 1.3,
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  Text(file.name,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        height: 1.3,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
                   const SizedBox(height: 6),
                   Row(
                     children: [
@@ -518,9 +622,9 @@ class _FilesScreenState extends State<FilesScreen>
                         _chip(file.readableDuration,
                             icon: Icons.access_time_rounded),
                       ],
-                      if (file.isVideo && file.qualities.isNotEmpty) ...[
+                      if (file.isVideo &&
+                          file.qualities.isNotEmpty) ...[
                         const SizedBox(width: 6),
-                        // Show best quality badge
                         _chip(file.qualities.first.label,
                             color: const Color(0xFF2AABEE)),
                       ],
@@ -531,8 +635,7 @@ class _FilesScreenState extends State<FilesScreen>
             ),
             const SizedBox(width: 10),
             Container(
-              width: 38,
-              height: 38,
+              width: 38, height: 38,
               decoration: BoxDecoration(
                 color: const Color(0xFF2AABEE).withOpacity(0.15),
                 shape: BoxShape.circle,
@@ -553,26 +656,24 @@ class _FilesScreenState extends State<FilesScreen>
     );
   }
 
-  Widget _buildThumbOrIcon(
-      TelegramFile file, IconData iconData, Color iconColor) {
+  Widget _buildThumbOrIcon(TelegramFile file) {
+    final icon = _iconFor(file);
+    final color = _colorFor(file);
     if (file.thumbnail != null && file.thumbnail!.isNotEmpty) {
       return ClipRRect(
         borderRadius: BorderRadius.circular(10),
         child: Image.file(
           File(file.thumbnail!),
-          width: 56,
-          height: 56,
-          fit: BoxFit.cover,
-          errorBuilder: (_, __, ___) => _iconBox(iconData, iconColor),
+          width: 56, height: 56, fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => _iconBox(icon, color),
         ),
       );
     }
-    return _iconBox(iconData, iconColor);
+    return _iconBox(icon, color);
   }
 
   Widget _iconBox(IconData icon, Color color) => Container(
-        width: 56,
-        height: 56,
+        width: 56, height: 56,
         decoration: BoxDecoration(
           color: color.withOpacity(0.12),
           borderRadius: BorderRadius.circular(10),
@@ -582,12 +683,10 @@ class _FilesScreenState extends State<FilesScreen>
 
   Widget _chip(String label, {IconData? icon, Color? color}) =>
       Container(
-        padding:
-            const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
         decoration: BoxDecoration(
-          color: const Color(0xFF1E1E35),
-          borderRadius: BorderRadius.circular(5),
-        ),
+            color: const Color(0xFF1E1E35),
+            borderRadius: BorderRadius.circular(5)),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -609,18 +708,18 @@ class _FilesScreenState extends State<FilesScreen>
   IconData _iconFor(TelegramFile file) {
     if (file.isVideo) return Icons.movie_rounded;
     if (file.isAudio) return Icons.audio_file_rounded;
-    final mime = file.mimeType.toLowerCase();
-    if (mime.contains('pdf')) return Icons.picture_as_pdf_rounded;
-    if (mime.contains('zip') ||
-        mime.contains('rar') ||
-        mime.contains('7z')) return Icons.folder_zip_rounded;
-    if (mime.contains('word') || mime.contains('document')) {
+    final m = file.mimeType.toLowerCase();
+    if (m.contains('pdf')) return Icons.picture_as_pdf_rounded;
+    if (m.contains('zip') || m.contains('rar') || m.contains('7z')) {
+      return Icons.folder_zip_rounded;
+    }
+    if (m.contains('word') || m.contains('document')) {
       return Icons.description_rounded;
     }
-    if (mime.contains('sheet') || mime.contains('excel')) {
+    if (m.contains('sheet') || m.contains('excel')) {
       return Icons.table_chart_rounded;
     }
-    if (mime.contains('presentation') || mime.contains('powerpoint')) {
+    if (m.contains('presentation') || m.contains('powerpoint')) {
       return Icons.slideshow_rounded;
     }
     return Icons.insert_drive_file_rounded;
@@ -629,15 +728,15 @@ class _FilesScreenState extends State<FilesScreen>
   Color _colorFor(TelegramFile file) {
     if (file.isVideo) return const Color(0xFF2AABEE);
     if (file.isAudio) return const Color(0xFF9B59B6);
-    final mime = file.mimeType.toLowerCase();
-    if (mime.contains('pdf')) return const Color(0xFFE74C3C);
-    if (mime.contains('zip') || mime.contains('rar')) {
+    final m = file.mimeType.toLowerCase();
+    if (m.contains('pdf')) return const Color(0xFFE74C3C);
+    if (m.contains('zip') || m.contains('rar')) {
       return const Color(0xFFF39C12);
     }
-    if (mime.contains('word') || mime.contains('document')) {
+    if (m.contains('word') || m.contains('document')) {
       return const Color(0xFF2980B9);
     }
-    if (mime.contains('sheet') || mime.contains('excel')) {
+    if (m.contains('sheet') || m.contains('excel')) {
       return const Color(0xFF27AE60);
     }
     return const Color(0xFF27AE60);
@@ -656,14 +755,12 @@ class _FilesScreenState extends State<FilesScreen>
             style: TextStyle(color: Color(0xFF9090B0))),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
           TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Logout',
-                style: TextStyle(color: Color(0xFFCF6679))),
-          ),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Logout',
+                  style: TextStyle(color: Color(0xFFCF6679)))),
         ],
       ),
     );
