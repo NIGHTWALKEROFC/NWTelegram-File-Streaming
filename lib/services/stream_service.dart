@@ -1,22 +1,4 @@
 // lib/services/stream_service.dart
-//
-// Proxy server that serves TDLib-downloaded bytes to libmpv (media_kit).
-//
-// Architecture change vs previous versions:
-// ─────────────────────────────────────────
-// OLD: downloadFile(synchronous:true, limit=512KB) per chunk
-//      → blocks Dart isolate for each chunk
-//      → large files stall, seek resets to start
-//
-// NEW: TDLib downloads the whole file continuously in background (C++ thread).
-//      readFileBytes() polls _activeDownloadPrefix (updated by updateFile events)
-//      and reads from the local file as bytes arrive.
-//      → TDLib downloads at full network speed the whole time
-//      → libmpv reads ahead as fast as data arrives
-//      → seek works: libmpv sends a new Range request, we wait for TDLib to
-//        reach that offset (TDLib automatically prioritises the new range)
-//      → small files: download completes in seconds, play instantly
-//      → large files: play starts after a small buffer, streams continuously
 
 import 'dart:async';
 import 'dart:io';
@@ -29,22 +11,25 @@ import 'package:shelf_router/shelf_router.dart';
 
 import 'telegram_service.dart';
 
-// How many bytes to serve per read — small enough to be responsive,
-// large enough for smooth playback.
-const int kChunkSize = 256 * 1024; // 256 KB
+const int kChunkSize  = 256 * 1024; // 256 KB per read
+const int kProxyPort  = 8484;
 
-const int kProxyPort = 8484;
+// If a Range request starts more than this many bytes ahead of where
+// TDLib has downloaded so far, restart the download from the new offset.
+// This makes seeking in large files instant instead of waiting for TDLib
+// to download all bytes from the beginning.
+const int kSeekRestartThreshold = 2 * 1024 * 1024; // 2 MB ahead = restart
 
 class StreamService extends ChangeNotifier {
-  HttpServer? _server;
+  HttpServer?      _server;
   TelegramService? _telegramService;
-  bool _isRunning = false;
-  int _activeFileId = 0;
-  int _activeFileSize = 0;
+  bool   _isRunning      = false;
+  int    _activeFileId   = 0;
+  int    _activeFileSize = 0;
   String _activeMimeType = 'application/octet-stream';
 
-  bool get isRunning => _isRunning;
-  String get streamUrl => 'http://127.0.0.1:$kProxyPort/stream';
+  bool   get isRunning  => _isRunning;
+  String get streamUrl  => 'http://127.0.0.1:$kProxyPort/stream';
 
   // ── Start / Stop ───────────────────────────────────────────────────────────
 
@@ -53,7 +38,7 @@ class StreamService extends ChangeNotifier {
     _telegramService = telegramService;
 
     final router = Router();
-    router.get('/ping', (Request req) => Response.ok('pong'));
+    router.get('/ping',   (Request req) => Response.ok('pong'));
     router.get('/stream', _handleStreamRequest);
     router.head('/stream', _handleHeadRequest);
     router.options('/stream',
@@ -64,51 +49,45 @@ class StreamService extends ChangeNotifier {
 
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
-        _server = await shelf_io.serve(handler, '127.0.0.1', kProxyPort);
-        _isRunning = true;
+        _server     = await shelf_io.serve(handler, '127.0.0.1', kProxyPort);
+        _isRunning  = true;
         debugPrint('StreamService: proxy on port $kProxyPort');
         notifyListeners();
         return;
       } on SocketException catch (e) {
         debugPrint('StreamService: bind attempt $attempt failed: $e');
-        if (attempt < 3) {
-          await Future.delayed(const Duration(milliseconds: 600));
-        }
+        if (attempt < 3) await Future.delayed(const Duration(milliseconds: 600));
       }
     }
     debugPrint('StreamService: could not bind after 3 attempts');
   }
 
   Future<void> stopServer() async {
-    try {
-      await _server?.close(force: true);
-    } catch (_) {}
-    _server = null;
+    try { await _server?.close(force: true); } catch (_) {}
+    _server    = null;
     _isRunning = false;
     notifyListeners();
   }
 
-  // Called by files_screen / player BEFORE opening the player.
-  // Starts background download so TDLib begins fetching immediately.
+  // Called before opening the player.
+  // Starts background TDLib download from byte 0.
   Future<bool> prepareFile({
-    required int fileId,
-    required int fileSize,
+    required int    fileId,
+    required int    fileSize,
     required String mimeType,
   }) async {
-    _activeFileId = fileId;
+    _activeFileId   = fileId;
     _activeFileSize = fileSize;
     _activeMimeType = mimeType;
 
-    debugPrint(
-        'StreamService: prepareFile id=$fileId size=$fileSize mime=$mimeType');
+    debugPrint('StreamService.prepareFile id=$fileId size=$fileSize');
 
     if (_telegramService == null) return false;
 
-    // Start background download — returns path if TDLib accepted the request
-    final path = await _telegramService!.startFileDownload(fileId);
-    debugPrint('StreamService: download started path=$path');
+    final result = await _telegramService!.startFileDownload(fileId, offset: 0);
+    debugPrint('StreamService.prepareFile result=$result');
     notifyListeners();
-    return path != null;
+    return result != null;
   }
 
   // ── HEAD ───────────────────────────────────────────────────────────────────
@@ -149,14 +128,16 @@ class StreamService extends ChangeNotifier {
 
     if (fileSize <= 0) {
       return _buildStreamResponse(
-          start: 0, end: -1, contentLength: -1,
-          fileSize: -1, statusCode: 200);
+        start: 0, end: -1, contentLength: -1,
+        fileSize: -1, statusCode: 200,
+      );
     }
 
     if (rangeHeader == null) {
       return _buildStreamResponse(
-          start: 0, end: fileSize - 1, contentLength: fileSize,
-          fileSize: fileSize, statusCode: 200);
+        start: 0, end: fileSize - 1, contentLength: fileSize,
+        fileSize: fileSize, statusCode: 200,
+      );
     }
 
     final range = _parseRange(rangeHeader, fileSize);
@@ -164,13 +145,34 @@ class StreamService extends ChangeNotifier {
       return Response(416, headers: {'Content-Range': 'bytes */$fileSize'});
     }
 
-    final start = range.$1;
-    final end = range.$2;
+    final start  = range.$1;
+    final end    = range.$2;
     final length = end - start + 1;
 
+    // ── SEEK DETECTION ──────────────────────────────────────────────────────
+    // If libmpv asks for bytes far ahead of what TDLib has downloaded,
+    // restart TDLib download from the seek position so playback resumes fast.
+    // Without this, a seek to 50% of a 1GB file would wait for TDLib to
+    // download 500MB from the start before serving a single byte.
+    if (start > 0 && _telegramService != null) {
+      final downloaded = _telegramService!.activeDownloadPrefix;
+      final gap = start - downloaded;
+      if (gap > kSeekRestartThreshold) {
+        debugPrint(
+            'StreamService: seek detected — start=$start downloaded=$downloaded '
+            'gap=$gap > threshold=$kSeekRestartThreshold — restarting download');
+        // Restart TDLib download from the seek offset
+        await _telegramService!.startFileDownload(
+          _activeFileId,
+          offset: start,
+        );
+      }
+    }
+
     return _buildStreamResponse(
-        start: start, end: end, contentLength: length,
-        fileSize: fileSize, statusCode: 206);
+      start: start, end: end, contentLength: length,
+      fileSize: fileSize, statusCode: 206,
+    );
   }
 
   // ── Stream builder ─────────────────────────────────────────────────────────
@@ -190,9 +192,7 @@ class StreamService extends ChangeNotifier {
       'Accept-Ranges': 'bytes',
       'Connection': 'keep-alive',
     };
-    if (contentLength > 0) {
-      headers['Content-Length'] = contentLength.toString();
-    }
+    if (contentLength > 0) headers['Content-Length'] = contentLength.toString();
     if (statusCode == 206 && fileSize > 0) {
       headers['Content-Range'] = 'bytes $start-$end/$fileSize';
     }
@@ -201,14 +201,6 @@ class StreamService extends ChangeNotifier {
   }
 
   // ── Chunk fetcher ──────────────────────────────────────────────────────────
-  //
-  // Calls readFileBytes() which polls TDLib's downloaded_prefix_size
-  // (updated via updateFile events) and reads from the local file.
-  //
-  // Because TDLib downloads continuously in the background, readFileBytes()
-  // typically waits only 100-200ms per chunk on a good connection.
-  // On seek, libmpv sends a new Range header with the seek offset.
-  // TDLib auto-prioritises that area of the file.
 
   void _fetchChunks(
     int start,
@@ -219,32 +211,26 @@ class StreamService extends ChangeNotifier {
 
     Future(() async {
       int offset = start;
-
       try {
         while (true) {
           if (controller.isClosed) break;
           if (!unbounded && offset > end) break;
 
-          final remaining =
-              unbounded ? kChunkSize : (end - offset + 1);
-          final count = remaining.clamp(1, kChunkSize);
+          final remaining = unbounded ? kChunkSize : (end - offset + 1);
+          final count     = remaining.clamp(1, kChunkSize);
 
           final Uint8List? bytes = await _telegramService!.readFileBytes(
             offset: offset,
-            count: count,
-            // Generous timeout — large files on slow connections need time
+            count:  count,
             timeoutSeconds: 120,
           );
 
           if (bytes == null) {
-            debugPrint(
-                'StreamService: readFileBytes null at offset=$offset (error)');
+            debugPrint('StreamService: null at offset=$offset — stopping');
             break;
           }
-
           if (bytes.isEmpty) {
-            debugPrint(
-                'StreamService: readFileBytes EOF at offset=$offset');
+            debugPrint('StreamService: EOF at offset=$offset');
             break;
           }
 
@@ -265,19 +251,17 @@ class StreamService extends ChangeNotifier {
     final match = RegExp(r'bytes=(\d*)-(\d*)').firstMatch(header);
     if (match == null) return null;
     final startStr = match.group(1) ?? '';
-    final endStr = match.group(2) ?? '';
+    final endStr   = match.group(2) ?? '';
     int start, end;
     if (startStr.isEmpty && endStr.isNotEmpty) {
       final suffix = int.tryParse(endStr) ?? 0;
       start = (fileSize - suffix).clamp(0, fileSize - 1);
-      end = fileSize - 1;
+      end   = fileSize - 1;
     } else {
       start = startStr.isEmpty ? 0 : int.tryParse(startStr) ?? 0;
-      end = endStr.isEmpty
-          ? fileSize - 1
-          : int.tryParse(endStr) ?? fileSize - 1;
+      end   = endStr.isEmpty ? fileSize - 1 : int.tryParse(endStr) ?? fileSize - 1;
     }
-    end = end.clamp(0, fileSize - 1);
+    end   = end.clamp(0, fileSize - 1);
     start = start.clamp(0, end);
     return (start, end);
   }
