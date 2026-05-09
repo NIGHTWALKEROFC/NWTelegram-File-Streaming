@@ -11,7 +11,8 @@ import 'package:path_provider/path_provider.dart';
 
 import '../models/telegram_file.dart';
 
-const int _kApiId = int.fromEnvironment('TG_API_ID', defaultValue: 0);
+const int _kApiId =
+    int.fromEnvironment('TG_API_ID', defaultValue: 0);
 const String _kApiHash =
     String.fromEnvironment('TG_API_HASH', defaultValue: '');
 
@@ -29,51 +30,50 @@ class TelegramService extends ChangeNotifier {
   int _clientId = 0;
   Timer? _pollTimer;
 
-  final _updateCtrl = StreamController<Map<String, dynamic>>.broadcast();
+  final _updateCtrl =
+      StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get updates => _updateCtrl.stream;
 
-  AuthState _authState = AuthState.idle;
-  String _errorMessage = '';
-  bool _isLoggedIn = false;
-  bool _isInitialized = false;
+  AuthState _authState   = AuthState.idle;
+  String _errorMessage   = '';
+  bool _isLoggedIn       = false;
+  bool _isInitialized    = false;
 
-  // Active download tracking — updated by updateFile events
-  int    _activeDownloadFileId    = 0;
-  String _activeDownloadPath      = '';
-  int    _activeDownloadOffset    = 0; // offset we started downloading from
-  int    _activeDownloadPrefix    = 0; // bytes downloaded so far (absolute)
-  bool   _activeDownloadComplete  = false;
+  // ── Active download state ──────────────────────────────────────────────────
+  int    _dlFileId    = 0;
+  String _dlPath      = '';
+  // Absolute byte position TDLib has downloaded up to (from file start).
+  // Updated by updateFile events. TDLib always reports this as absolute.
+  int    _dlAbsPrefix = 0;
+  bool   _dlComplete  = false;
 
-  AuthState get authState          => _authState;
-  String    get errorMessage       => _errorMessage;
-  bool      get isLoggedIn         => _isLoggedIn;
-  bool      get isInitialized      => _isInitialized;
-  // Exposed so stream_service can check how far TDLib has downloaded
-  // before deciding whether to restart download on seek.
-  int       get activeDownloadPrefix => _activeDownloadPrefix;
+  AuthState get authState      => _authState;
+  String    get errorMessage   => _errorMessage;
+  bool      get isLoggedIn     => _isLoggedIn;
+  bool      get isInitialized  => _isInitialized;
+  // Exposed so stream_service can check downloaded progress for seek detection
+  int       get dlAbsPrefix    => _dlAbsPrefix;
 
   // ── Initialize ─────────────────────────────────────────────────────────────
 
   Future<void> initialize() async {
     if (_isInitialized) return;
-
     if (_kApiId == 0 || _kApiHash.isEmpty) {
       _errorMessage =
           'Telegram API credentials missing.\n'
-          'Set TG_API_ID and TG_API_HASH in Codemagic → Environment Variables '
-          '(group: telegram_keys).';
+          'Set TG_API_ID and TG_API_HASH in Codemagic → '
+          'Environment Variables (group: telegram_keys).';
       _authState = AuthState.error;
       notifyListeners();
       return;
     }
-
     try {
       TdPlugin.initialize();
       _clientId = TdPlugin.instance.tdCreateClientId();
       _startPolling();
 
-      final appDir  = await getApplicationDocumentsDirectory();
-      final dbPath  = '${appDir.path}/tdlib_db';
+      final appDir    = await getApplicationDocumentsDirectory();
+      final dbPath    = '${appDir.path}/tdlib_db';
       final filesPath = '${appDir.path}/tdlib_files';
       await io.Directory(dbPath).create(recursive: true);
       await io.Directory(filesPath).create(recursive: true);
@@ -97,7 +97,6 @@ class TelegramService extends ChangeNotifier {
       });
 
       _isInitialized = true;
-
       await updates
           .where((u) => u['@type'] == 'updateAuthorizationState')
           .first
@@ -114,7 +113,8 @@ class TelegramService extends ChangeNotifier {
 
   void _startPolling() {
     _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 10), (_) {
+    _pollTimer =
+        Timer.periodic(const Duration(milliseconds: 10), (_) {
       if (_updateCtrl.isClosed) return;
       try {
         final raw = TdPlugin.instance.tdReceive(0.0);
@@ -138,29 +138,28 @@ class TelegramService extends ChangeNotifier {
   void _handleUpdate(Map<String, dynamic> u) {
     switch (u['@type'] as String?) {
       case 'updateAuthorizationState':
-        final state = u['authorization_state'] as Map<String, dynamic>?;
-        if (state != null) _handleAuthState(state);
+        final s = u['authorization_state'] as Map<String, dynamic>?;
+        if (s != null) _handleAuthState(s);
         break;
 
-      // Track file download progress — used by readFileBytes polling loop
       case 'updateFile':
+        // TDLib fires updateFile whenever download progress changes.
+        // downloaded_prefix_size is ALWAYS absolute from byte 0.
         final file   = u['file'] as Map<String, dynamic>?;
         if (file == null) break;
         final fileId = file['id'] as int? ?? 0;
-        if (fileId != _activeDownloadFileId) break;
-
+        if (fileId != _dlFileId) break;
         final local    = file['local'] as Map<String, dynamic>?;
         if (local == null) break;
         final path     = local['path'] as String? ?? '';
-        final prefix   = local['downloaded_prefix_size'] as int? ?? 0;
+        final absPrefix = local['downloaded_prefix_size'] as int? ?? 0;
         final complete = local['is_downloading_completed'] as bool? ?? false;
-
-        if (path.isNotEmpty && _activeDownloadPath.isEmpty) {
-          _activeDownloadPath = path;
-        }
-        // prefix is absolute from byte 0, even if we started at an offset
-        if (prefix > _activeDownloadPrefix) _activeDownloadPrefix = prefix;
-        if (complete) _activeDownloadComplete = complete;
+        if (path.isNotEmpty && _dlPath.isEmpty) _dlPath = path;
+        // Always update with latest — TDLib only increases this value
+        if (absPrefix > _dlAbsPrefix) _dlAbsPrefix = absPrefix;
+        if (complete) _dlComplete = complete;
+        debugPrint(
+            'updateFile[$fileId] absPrefix=$absPrefix complete=$complete');
         break;
     }
   }
@@ -172,17 +171,18 @@ class TelegramService extends ChangeNotifier {
         _authState = AuthState.idle;
         break;
       case 'authorizationStateWaitEncryptionKey':
-        _send({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''});
+        _send({'@type': 'checkDatabaseEncryptionKey',
+            'encryption_key': ''});
         return;
       case 'authorizationStateWaitPhoneNumber':
-        _authState = AuthState.waitingPhone;
+        _authState  = AuthState.waitingPhone;
         _isLoggedIn = false;
         break;
       case 'authorizationStateWaitCode':
         _authState = AuthState.waitingCode;
         break;
       case 'authorizationStateWaitOtherDeviceConfirmation':
-        _authState = AuthState.waitingCode;
+        _authState    = AuthState.waitingCode;
         _errorMessage = 'Confirm login on your other Telegram device.';
         break;
       case 'authorizationStateWaitRegistration':
@@ -192,8 +192,8 @@ class TelegramService extends ChangeNotifier {
         _authState = AuthState.waitingPassword;
         break;
       case 'authorizationStateReady':
-        _authState   = AuthState.authorized;
-        _isLoggedIn  = true;
+        _authState    = AuthState.authorized;
+        _isLoggedIn   = true;
         _errorMessage = '';
         break;
       case 'authorizationStateLoggingOut':
@@ -222,7 +222,8 @@ class TelegramService extends ChangeNotifier {
         return;
       }
       if (u['@type'] == 'updateAuthorizationState') {
-        final t = (u['authorization_state'] as Map<String, dynamic>?)?['@type'] as String?;
+        final t = (u['authorization_state']
+                as Map<String, dynamic>?)?['@type'] as String?;
         if (t == 'authorizationStateWaitCode' ||
             t == 'authorizationStateWaitOtherDeviceConfirmation' ||
             t == 'authorizationStateWaitPassword' ||
@@ -245,13 +246,13 @@ class TelegramService extends ChangeNotifier {
     });
     if (!completer.isCompleted &&
         (_authState == AuthState.waitingCode ||
-         _authState == AuthState.waitingPassword ||
-         _authState == AuthState.authorized)) {
+            _authState == AuthState.waitingPassword ||
+            _authState == AuthState.authorized)) {
       completer.complete(true);
       sub.cancel();
     }
-    return completer.future.timeout(const Duration(seconds: 60),
-        onTimeout: () {
+    return completer.future
+        .timeout(const Duration(seconds: 60), onTimeout: () {
       sub.cancel();
       if (_authState == AuthState.waitingCode ||
           _authState == AuthState.waitingPassword ||
@@ -276,7 +277,8 @@ class TelegramService extends ChangeNotifier {
         return;
       }
       if (u['@type'] == 'updateAuthorizationState') {
-        final t = (u['authorization_state'] as Map<String, dynamic>?)?['@type'] as String?;
+        final t = (u['authorization_state']
+                as Map<String, dynamic>?)?['@type'] as String?;
         if (t == 'authorizationStateReady' ||
             t == 'authorizationStateWaitPassword') {
           completer.complete(true);
@@ -287,16 +289,17 @@ class TelegramService extends ChangeNotifier {
     _send({'@type': 'checkAuthenticationCode', 'code': code});
     if (!completer.isCompleted &&
         (_authState == AuthState.authorized ||
-         _authState == AuthState.waitingPassword)) {
+            _authState == AuthState.waitingPassword)) {
       completer.complete(true);
       sub.cancel();
     }
-    return completer.future.timeout(const Duration(seconds: 30),
-        onTimeout: () {
+    return completer.future
+        .timeout(const Duration(seconds: 30), onTimeout: () {
       sub.cancel();
       if (_authState == AuthState.authorized ||
           _authState == AuthState.waitingPassword) return true;
-      _errorMessage = _errorMessage.isNotEmpty ? _errorMessage : 'Timed out.';
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out.';
       notifyListeners();
       return false;
     });
@@ -316,7 +319,8 @@ class TelegramService extends ChangeNotifier {
         return;
       }
       if (u['@type'] == 'updateAuthorizationState') {
-        final t = (u['authorization_state'] as Map<String, dynamic>?)?['@type'] as String?;
+        final t = (u['authorization_state']
+                as Map<String, dynamic>?)?['@type'] as String?;
         if (t == 'authorizationStateReady') {
           completer.complete(true);
           sub.cancel();
@@ -328,11 +332,12 @@ class TelegramService extends ChangeNotifier {
       completer.complete(true);
       sub.cancel();
     }
-    return completer.future.timeout(const Duration(seconds: 30),
-        onTimeout: () {
+    return completer.future
+        .timeout(const Duration(seconds: 30), onTimeout: () {
       sub.cancel();
       if (_authState == AuthState.authorized) return true;
-      _errorMessage = _errorMessage.isNotEmpty ? _errorMessage : 'Timed out.';
+      _errorMessage =
+          _errorMessage.isNotEmpty ? _errorMessage : 'Timed out.';
       notifyListeners();
       return false;
     });
@@ -359,10 +364,14 @@ class TelegramService extends ChangeNotifier {
       'limit': 100,
     });
     if (res == null || res['@type'] == 'error') return [];
-    return (res['chat_ids'] as List?)?.map((e) => e as int).toList() ?? [];
+    return (res['chat_ids'] as List?)
+            ?.map((e) => e as int)
+            .toList() ??
+        [];
   }
 
-  Future<List<TelegramFile>> _getMediaFromChat(int chatId, int limit) async {
+  Future<List<TelegramFile>> _getMediaFromChat(
+      int chatId, int limit) async {
     const filters = [
       'searchMessagesFilterVideo',
       'searchMessagesFilterAudio',
@@ -383,7 +392,7 @@ class TelegramService extends ChangeNotifier {
           'message_thread_id': 0,
         }, timeout: const Duration(seconds: 15));
         if (res == null || res['@type'] == 'error') return <TelegramFile>[];
-        final msgs = res['messages'] as List? ?? [];
+        final msgs  = res['messages'] as List? ?? [];
         final files = <TelegramFile>[];
         for (final msg in msgs) {
           final f = _parseMessage(msg as Map<String, dynamic>);
@@ -397,7 +406,8 @@ class TelegramService extends ChangeNotifier {
     return results.expand((r) => r).toList();
   }
 
-  Stream<List<TelegramFile>> streamAllMediaFiles({int limitPerChat = 30}) async* {
+  Stream<List<TelegramFile>> streamAllMediaFiles(
+      {int limitPerChat = 30}) async* {
     final accumulated = <TelegramFile>[];
     List<int> chatIds;
     try {
@@ -406,17 +416,22 @@ class TelegramService extends ChangeNotifier {
       yield [];
       return;
     }
-    if (chatIds.isEmpty) { yield []; return; }
-
+    if (chatIds.isEmpty) {
+      yield [];
+      return;
+    }
     const batchSize = 3;
     for (int i = 0; i < chatIds.length; i += batchSize) {
       final batch = chatIds.skip(i).take(batchSize).toList();
-      final results = await Future.wait(batch.map(
-          (id) => _getMediaFromChat(id, limitPerChat)
+      final results = await Future.wait(batch.map((id) =>
+          _getMediaFromChat(id, limitPerChat)
               .catchError((_) => <TelegramFile>[])));
       bool added = false;
       for (final r in results) {
-        if (r.isNotEmpty) { accumulated.addAll(r); added = true; }
+        if (r.isNotEmpty) {
+          accumulated.addAll(r);
+          added = true;
+        }
       }
       if (added) {
         accumulated.sort((a, b) => b.fileSize.compareTo(a.fileSize));
@@ -429,28 +444,24 @@ class TelegramService extends ChangeNotifier {
   // ── Streaming ──────────────────────────────────────────────────────────────
   //
   // startFileDownload(fileId, offset):
-  //   - Downloads from [offset] forward at full speed in TDLib's C++ thread
-  //   - offset=0 for initial play, offset=seekTarget for seeks
-  //   - Returns 'pending' on success (path arrives via updateFile shortly)
-  //   - Returns null on TDLib error
+  //   Tells TDLib to download from [offset] onward continuously.
+  //   _dlAbsPrefix tracks absolute bytes downloaded (from file byte 0).
   //
   // readFileBytes(offset, count):
-  //   - Polls _activeDownloadPrefix until enough bytes are available
-  //   - Reads directly from local file — no blocking Dart calls
-  //
-  // cancelAndDeleteFile():
-  //   - Stops download + deletes local file immediately
-  //   - Call this when player closes (guaranteed cleanup)
+  //   Waits until _dlAbsPrefix >= (offset + count) then reads from disk.
+  //   Uses ABSOLUTE comparison — both _dlAbsPrefix and (offset+count) are
+  //   absolute byte positions from file start. This is the critical fix:
+  //   previous code initialised _dlAbsPrefix to the start offset, so when
+  //   TDLib reported absPrefix=5000 the check 5000 >= 5262144 always failed.
+  //   Now _dlAbsPrefix starts at 0 and updates to whatever TDLib reports.
 
   Future<String?> startFileDownload(int fileId, {int offset = 0}) async {
-    // Cancel and delete the previous file first
     await cancelAndDeleteFile();
 
-    _activeDownloadFileId   = fileId;
-    _activeDownloadPath     = '';
-    _activeDownloadOffset   = offset;
-    _activeDownloadPrefix   = offset; // TDLib prefix starts at offset
-    _activeDownloadComplete = false;
+    _dlFileId    = fileId;
+    _dlPath      = '';
+    _dlAbsPrefix = 0;   // always 0 — updateFile gives absolute position
+    _dlComplete  = false;
 
     debugPrint('TG.startFileDownload fileId=$fileId offset=$offset');
 
@@ -461,73 +472,72 @@ class TelegramService extends ChangeNotifier {
           'file_id': fileId,
           'priority': 32,
           'offset': offset,
-          'limit': 0,          // 0 = download everything from offset onward
-          'synchronous': false, // return immediately, download in background
+          'limit': 0,          // 0 = download to end of file
+          'synchronous': false, // return immediately
         },
         timeout: const Duration(seconds: 15),
       );
 
       if (res == null || res['@type'] == 'error') {
         debugPrint('TG.startFileDownload error: ${res?['message']}');
-        _activeDownloadFileId = 0;
+        _dlFileId = 0;
         return null;
       }
 
       final local    = res['local'] as Map<String, dynamic>?;
       final path     = local?['path']    as String? ?? '';
-      final prefix   = local?['downloaded_prefix_size'] as int? ?? 0;
+      final absPrefix = local?['downloaded_prefix_size'] as int? ?? 0;
       final complete = local?['is_downloading_completed'] as bool? ?? false;
 
-      if (path.isNotEmpty)  _activeDownloadPath     = path;
-      if (prefix  > offset) _activeDownloadPrefix   = prefix;
-      if (complete)         _activeDownloadComplete = true;
+      if (path.isNotEmpty) _dlPath      = path;
+      if (absPrefix > 0)   _dlAbsPrefix = absPrefix;
+      if (complete)        _dlComplete  = complete;
 
-      debugPrint('TG.startFileDownload: path=$path prefix=$prefix complete=$complete');
-      // 'pending' = success (path may arrive via updateFile shortly)
+      debugPrint(
+          'TG.startFileDownload ok path=$path absPrefix=$absPrefix complete=$complete');
       return 'ok';
     } catch (e) {
       debugPrint('TG.startFileDownload exception: $e');
-      _activeDownloadFileId = 0;
+      _dlFileId = 0;
       return null;
     }
   }
 
-  // Read [count] bytes from local file at [offset].
-  // Waits until TDLib has downloaded up to offset+count.
+  // Read [count] bytes from absolute file position [offset].
+  // Waits (polling every 100 ms) until TDLib has downloaded past offset+count.
   Future<Uint8List?> readFileBytes({
     required int offset,
     required int count,
     int timeoutSeconds = 120,
   }) async {
-    final fileId = _activeDownloadFileId;
+    final fileId = _dlFileId;
     if (fileId == 0) {
       debugPrint('TG.readFileBytes: no active download');
       return null;
     }
 
-    final deadline = DateTime.now().add(Duration(seconds: timeoutSeconds));
+    final deadline =
+        DateTime.now().add(Duration(seconds: timeoutSeconds));
 
     while (DateTime.now().isBefore(deadline)) {
-      // Stop if file was cancelled or switched
-      if (_activeDownloadFileId != fileId) {
+      if (_dlFileId != fileId) {
         debugPrint('TG.readFileBytes: fileId changed, stopping');
         return null;
       }
 
-      final path     = _activeDownloadPath;
-      final prefix   = _activeDownloadPrefix;
-      final complete = _activeDownloadComplete;
+      final path     = _dlPath;
+      final absPrefix = _dlAbsPrefix;
+      final complete = _dlComplete;
 
-      // Path not yet created — TDLib hasn't written any bytes yet
       if (path.isEmpty) {
+        // TDLib hasn't created local file yet — normal for first ~1s
         await Future.delayed(const Duration(milliseconds: 100));
         continue;
       }
 
+      // CORRECT check: both sides are absolute byte positions from file start
       final needed = offset + count;
-
-      // Have enough bytes OR download is complete — try to read
-      if (prefix >= needed || complete) {
+      if (absPrefix >= needed || complete) {
         try {
           final file = io.File(path);
           if (!await file.exists()) {
@@ -535,7 +545,7 @@ class TelegramService extends ChangeNotifier {
             return null;
           }
           final fileLen = await file.length();
-          if (fileLen <= offset) return Uint8List(0); // real EOF
+          if (fileLen <= offset) return Uint8List(0); // EOF
           final canRead = (fileLen - offset).clamp(0, count);
           final raf = await file.open();
           try {
@@ -553,33 +563,27 @@ class TelegramService extends ChangeNotifier {
       await Future.delayed(const Duration(milliseconds: 100));
     }
 
-    debugPrint('TG.readFileBytes: timeout at offset=$offset after ${timeoutSeconds}s');
+    debugPrint(
+        'TG.readFileBytes: timeout offset=$offset after ${timeoutSeconds}s '
+        'absPrefix=$_dlAbsPrefix needed=${offset + count}');
     return null;
   }
 
-  // ── Guaranteed cleanup ─────────────────────────────────────────────────────
-  //
-  // Stops TDLib download + deletes local file from device storage.
-  // Safe to call multiple times (no-op if nothing active).
-  // Stores fileId/path locally BEFORE resetting state so async ops
-  // can complete even if called from dispose().
+  // ── Cleanup ────────────────────────────────────────────────────────────────
 
   Future<void> cancelAndDeleteFile() async {
-    if (_activeDownloadFileId == 0) return;
+    if (_dlFileId == 0) return;
+    final fileId = _dlFileId;
+    final path   = _dlPath;
 
-    final fileId = _activeDownloadFileId;
-    final path   = _activeDownloadPath;
+    // Reset immediately so readFileBytes stops polling
+    _dlFileId    = 0;
+    _dlPath      = '';
+    _dlAbsPrefix = 0;
+    _dlComplete  = false;
 
-    // Reset state immediately so readFileBytes stops polling
-    _activeDownloadFileId   = 0;
-    _activeDownloadPath     = '';
-    _activeDownloadOffset   = 0;
-    _activeDownloadPrefix   = 0;
-    _activeDownloadComplete = false;
+    debugPrint('TG.cancelAndDeleteFile fileId=$fileId');
 
-    debugPrint('TG.cancelAndDeleteFile fileId=$fileId path=$path');
-
-    // Step 1: stop TDLib download
     try {
       await _request({
         '@type': 'cancelDownloadFile',
@@ -587,18 +591,16 @@ class TelegramService extends ChangeNotifier {
         'only_if_pending': false,
       });
     } catch (e) {
-      debugPrint('TG.cancelDownloadFile error (non-fatal): $e');
+      debugPrint('TG.cancelDownloadFile error: $e');
     }
 
-    // Step 2: delete via TDLib API
     try {
       await _request({'@type': 'deleteFile', 'file_id': fileId});
       debugPrint('TG.deleteFile done fileId=$fileId');
     } catch (e) {
-      debugPrint('TG.deleteFile error (non-fatal): $e');
+      debugPrint('TG.deleteFile error: $e');
     }
 
-    // Step 3: physical delete as safety net
     if (path.isNotEmpty) {
       try {
         final f = io.File(path);
@@ -612,7 +614,6 @@ class TelegramService extends ChangeNotifier {
     }
   }
 
-  // Wipe ALL cached files (for manual clear cache button)
   Future<void> clearAllCache() async {
     try {
       await _request({
@@ -635,7 +636,8 @@ class TelegramService extends ChangeNotifier {
 
   Future<int> getFileSize(int fileId) async {
     try {
-      final res = await _request({'@type': 'getFile', 'file_id': fileId});
+      final res =
+          await _request({'@type': 'getFile', 'file_id': fileId});
       if (res == null || res['@type'] == 'error') return 0;
       final s = res['size'] as int? ?? 0;
       return s > 0 ? s : (res['expected_size'] as int? ?? 0);
@@ -655,7 +657,7 @@ class TelegramService extends ChangeNotifier {
       case 'messageDocument':  return _parseDocument(content);
       case 'messageVoiceNote': return _parseVoice(content);
       case 'messageVideoNote': return _parseVideoNote(content);
-      default: return null;
+      default:                 return null;
     }
   }
 
@@ -667,9 +669,9 @@ class TelegramService extends ChangeNotifier {
   TelegramFile? _parseVideo(Map<String, dynamic> content) {
     final video = content['video'] as Map<String, dynamic>?;
     if (video == null) return null;
-    final file  = video['video'] as Map<String, dynamic>?;
+    final file = video['video'] as Map<String, dynamic>?;
     if (file == null) return null;
-    final w = video['width']  as int? ?? 0;
+    final w = video['width'] as int? ?? 0;
     final h = video['height'] as int? ?? 0;
     final qualities = <VideoQuality>[
       VideoQuality(
@@ -685,8 +687,11 @@ class TelegramService extends ChangeNotifier {
       if (af == null) continue;
       final ah = a['height'] as int? ?? 0;
       qualities.add(VideoQuality(
-        label: _label(ah), width: a['width'] as int? ?? 0, height: ah,
-        fileId: af['id'] as int? ?? 0, fileSize: _sz(af),
+        label: _label(ah),
+        width: a['width'] as int? ?? 0,
+        height: ah,
+        fileId: af['id'] as int? ?? 0,
+        fileSize: _sz(af),
         remoteId: (af['remote'] as Map?)?['id'] as String? ?? '',
       ));
     }
@@ -697,7 +702,8 @@ class TelegramService extends ChangeNotifier {
       mimeType: video['mime_type'] as String? ?? 'video/mp4',
       duration: video['duration'] as int? ?? 0,
       width: w, height: h,
-      fileId: file['id'] as int? ?? 0, fileSize: _sz(file),
+      fileId: file['id'] as int? ?? 0,
+      fileSize: _sz(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       thumbnail: _thumbPath(video['thumbnail']),
       qualities: qualities,
@@ -713,7 +719,8 @@ class TelegramService extends ChangeNotifier {
       name: audio['file_name'] as String? ?? 'audio.mp3',
       mimeType: audio['mime_type'] as String? ?? 'audio/mpeg',
       duration: audio['duration'] as int? ?? 0,
-      fileId: file['id'] as int? ?? 0, fileSize: _sz(file),
+      fileId: file['id'] as int? ?? 0,
+      fileSize: _sz(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -724,7 +731,8 @@ class TelegramService extends ChangeNotifier {
     final file = doc?['document'] as Map<String, dynamic>?;
     if (doc == null || file == null) return null;
     final fileName = doc['file_name'] as String? ?? 'file';
-    final mimeType = doc['mime_type'] as String? ?? 'application/octet-stream';
+    final mimeType =
+        doc['mime_type'] as String? ?? 'application/octet-stream';
     TelegramFileType realType;
     if (TelegramFile.mimeIsVideo(mimeType)) {
       realType = TelegramFileType.video;
@@ -734,8 +742,11 @@ class TelegramService extends ChangeNotifier {
       realType = TelegramFile.typeFromExtension(fileName);
     }
     return TelegramFile(
-      type: realType, name: fileName, mimeType: mimeType,
-      fileId: file['id'] as int? ?? 0, fileSize: _sz(file),
+      type: realType,
+      name: fileName,
+      mimeType: mimeType,
+      fileId: file['id'] as int? ?? 0,
+      fileSize: _sz(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       thumbnail: _thumbPath(doc['thumbnail']),
       qualities: [],
@@ -747,10 +758,12 @@ class TelegramService extends ChangeNotifier {
     final file  = voice?['voice'] as Map<String, dynamic>?;
     if (voice == null || file == null) return null;
     return TelegramFile(
-      type: TelegramFileType.audio, name: 'voice_note.ogg',
+      type: TelegramFileType.audio,
+      name: 'voice_note.ogg',
       mimeType: voice['mime_type'] as String? ?? 'audio/ogg',
       duration: voice['duration'] as int? ?? 0,
-      fileId: file['id'] as int? ?? 0, fileSize: _sz(file),
+      fileId: file['id'] as int? ?? 0,
+      fileSize: _sz(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -761,9 +774,12 @@ class TelegramService extends ChangeNotifier {
     final file = vn?['video'] as Map<String, dynamic>?;
     if (vn == null || file == null) return null;
     return TelegramFile(
-      type: TelegramFileType.video, name: 'video_note.mp4', mimeType: 'video/mp4',
+      type: TelegramFileType.video,
+      name: 'video_note.mp4',
+      mimeType: 'video/mp4',
       duration: vn['duration'] as int? ?? 0,
-      fileId: file['id'] as int? ?? 0, fileSize: _sz(file),
+      fileId: file['id'] as int? ?? 0,
+      fileSize: _sz(file),
       remoteFileId: (file['remote'] as Map?)?['id'] as String? ?? '',
       qualities: [],
     );
@@ -781,7 +797,8 @@ class TelegramService extends ChangeNotifier {
 
   String? _thumbPath(dynamic t) {
     if (t == null) return null;
-    final f = (t as Map<String, dynamic>?)?['file'] as Map<String, dynamic>?;
+    final f =
+        (t as Map<String, dynamic>?)?['file'] as Map<String, dynamic>?;
     return (f?['local'] as Map<String, dynamic>?)?['path'] as String?;
   }
 
