@@ -1,4 +1,21 @@
 // lib/screens/files_screen.dart
+//
+// FIXES IN THIS VERSION
+// ─────────────────────
+// 1. No delay when clicking a file
+//    Old code showed a "Preparing stream..." snackbar and awaited
+//    prepareFile() BEFORE navigating. That added 1-3 seconds of
+//    dead time on every tap.
+//    New flow: navigate to PlayerScreen immediately, let the player
+//    open the HTTP proxy URL right away. prepareFile() runs in the
+//    background — TDLib starts downloading while media_kit is sending
+//    its first HTTP request, so the first chunk is ready as soon as
+//    the player connects.
+//
+// 2. Audio size=0 propagation
+//    prepareFile now receives fileSize (may be 0 for audio) and
+//    stream_service/telegram_service resolve the real size internally.
+//    No change needed here — we just stop blocking on the result.
 
 import 'dart:async';
 import 'dart:io';
@@ -25,15 +42,15 @@ class _FilesScreenState extends State<FilesScreen>
   List<TelegramFile> _allFiles = [];
   List<TelegramFile> _filtered = [];
   bool _isLoading = true;
-  bool _hasData = false;
+  bool _hasData   = false;
   String? _loadError;
   StreamSubscription<List<TelegramFile>>? _fileSub;
-  String _cacheSize = '';   // shown in appbar actions
+  String _cacheSize = '';
 
   int _tabIndex = 0;
   final TextEditingController _searchController = TextEditingController();
-  final FocusNode _searchFocus = FocusNode();
-  late final TabController _tabController;
+  final FocusNode             _searchFocus      = FocusNode();
+  late final TabController    _tabController;
 
   static const _tabs = ['All', 'Video', 'Audio', 'Docs'];
 
@@ -65,13 +82,12 @@ class _FilesScreenState extends State<FilesScreen>
   void _startLoading() {
     _fileSub?.cancel();
     setState(() {
-      _allFiles = [];
-      _filtered = [];
+      _allFiles  = [];
+      _filtered  = [];
       _isLoading = true;
-      _hasData = false;
+      _hasData   = false;
       _loadError = null;
     });
-    // Refresh cache size each time we reload
     _loadCacheSize();
 
     final svc = context.read<TelegramService>();
@@ -80,7 +96,7 @@ class _FilesScreenState extends State<FilesScreen>
         if (!mounted) return;
         setState(() {
           _allFiles = files;
-          _hasData = files.isNotEmpty;
+          _hasData  = files.isNotEmpty;
         });
         _applyFilter();
       },
@@ -102,7 +118,7 @@ class _FilesScreenState extends State<FilesScreen>
 
   Future<void> _loadCacheSize() async {
     try {
-      final appDir = await getApplicationDocumentsDirectory();
+      final appDir   = await getApplicationDocumentsDirectory();
       final filesDir = Directory('${appDir.path}/tdlib_files');
       if (!await filesDir.exists()) {
         if (mounted) setState(() => _cacheSize = '0 B');
@@ -110,12 +126,10 @@ class _FilesScreenState extends State<FilesScreen>
       }
       int total = 0;
       await for (final entity in filesDir.list(recursive: true)) {
-        if (entity is File) {
-          total += await entity.length();
-        }
+        if (entity is File) total += await entity.length();
       }
       if (mounted) setState(() => _cacheSize = _fmtBytes(total));
-    } catch (e) {
+    } catch (_) {
       if (mounted) setState(() => _cacheSize = '');
     }
   }
@@ -133,7 +147,8 @@ class _FilesScreenState extends State<FilesScreen>
           'This will delete all locally cached files '
           '(${_cacheSize.isNotEmpty ? _cacheSize : "calculating..."}). '
           'Files remain safe on Telegram servers.',
-          style: const TextStyle(color: Color(0xFF9090B0), height: 1.5),
+          style: const TextStyle(
+              color: Color(0xFF9090B0), height: 1.5),
         ),
         actions: [
           TextButton(
@@ -152,7 +167,6 @@ class _FilesScreenState extends State<FilesScreen>
     );
     if (confirm != true || !mounted) return;
 
-    // Show progress
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
       content: Text('Clearing cache...'),
       backgroundColor: Color(0xFF1A1A2E),
@@ -168,8 +182,7 @@ class _FilesScreenState extends State<FilesScreen>
       content: const Text('Cache cleared!'),
       backgroundColor: const Color(0xFF27AE60),
       behavior: SnackBarBehavior.floating,
-      shape:
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       duration: const Duration(seconds: 2),
     ));
 
@@ -192,8 +205,8 @@ class _FilesScreenState extends State<FilesScreen>
     final query = _searchController.text.trim().toLowerCase();
     List<TelegramFile> result = List.of(_allFiles);
     switch (_tabIndex) {
-      case 1: result = result.where((f) => f.isVideo).toList(); break;
-      case 2: result = result.where((f) => f.isAudio).toList(); break;
+      case 1: result = result.where((f) => f.isVideo).toList();    break;
+      case 2: result = result.where((f) => f.isAudio).toList();    break;
       case 3: result = result.where((f) => f.isDocument).toList(); break;
     }
     if (query.isNotEmpty) {
@@ -205,77 +218,58 @@ class _FilesScreenState extends State<FilesScreen>
   }
 
   // ── Play a file ────────────────────────────────────────────────────────────
+  //
+  // FIX: Navigate to PlayerScreen immediately — no blocking await.
+  //
+  // Old flow:  tap → await prepareFile (~1-3 s) → navigate
+  // New flow:  tap → navigate instantly → prepareFile runs in background
+  //
+  // PlayerScreen opens the proxy URL right away. The first HTTP request
+  // from media_kit arrives at the proxy while TDLib is already downloading,
+  // so the player gets data with minimal latency.
+  //
+  // If the server isn't running yet (rare race on cold start), we start it
+  // synchronously before navigating — that's still fast (~200 ms).
 
   Future<void> _playFile(TelegramFile file) async {
-    final streamSvc = context.read<StreamService>();
-    final telegramSvc = context.read<TelegramService>();
+    final streamSvc    = context.read<StreamService>();
+    final telegramSvc  = context.read<TelegramService>();
 
+    // Ensure the proxy server is up (fast if already running)
     if (!streamSvc.isRunning) {
       await streamSvc.startServer(telegramSvc);
     }
 
-    // For video with multiple qualities: start with lowest (fastest to load).
-    // Player offers manual picker to switch up.
-    // For single-quality video / audio / doc: use the file's own fileId.
+    // Pick quality: lowest for videos with multiple streams (fastest start),
+    // or the only available quality, or null for audio/docs.
     VideoQuality? initialQuality;
     if (file.isVideo && file.qualities.length > 1) {
-      initialQuality = file.qualities.last; // lowest = fastest
+      initialQuality = file.qualities.last;  // lowest = fastest buffering
     } else if (file.isVideo && file.qualities.length == 1) {
       initialQuality = file.qualities.first;
     }
 
-    final int fileId = initialQuality?.fileId ?? file.fileId;
-    final int fileSize = initialQuality?.fileSize ?? file.fileSize;
+    final int fileId   = initialQuality?.fileId   ?? file.fileId;
+    final int fileSize = initialQuality?.fileSize  ?? file.fileSize;
 
-    // Show "Preparing…" while download starts
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: const Row(children: [
-        SizedBox(
-          width: 16, height: 16,
-          child: CircularProgressIndicator(
-              strokeWidth: 2, color: Colors.white),
-        ),
-        SizedBox(width: 12),
-        Text('Preparing stream...'),
-      ]),
-      backgroundColor: const Color(0xFF1A1A2E),
-      duration: const Duration(seconds: 30),
-      behavior: SnackBarBehavior.floating,
-      shape:
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-    ));
-
-    // Start the background download — TDLib begins fetching immediately.
-    // prepareFile returns as soon as TDLib acknowledges the request (~1s).
-    final ok = await streamSvc.prepareFile(
-      fileId: fileId,
-      fileSize: fileSize,
-      mimeType: file.mimeType,
-    );
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-
-    if (!ok) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: const Text('Failed to start download. Check connection.'),
-        backgroundColor: const Color(0xFFCF6679),
-        behavior: SnackBarBehavior.floating,
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        duration: const Duration(seconds: 3),
-      ));
-      return;
-    }
-
+    // ── Navigate immediately — no waiting ──────────────────────────────────
     if (!mounted) return;
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => PlayerScreen(
-        file: file,
+        file:           file,
         initialQuality: initialQuality,
-        streamUrl: streamSvc.streamUrl,
+        streamUrl:      streamSvc.streamUrl,
       ),
+    ));
+
+    // ── Start download in background ───────────────────────────────────────
+    // This runs while PlayerScreen is animating in and media_kit is
+    // initialising — by the time the first HTTP request arrives at the
+    // proxy, TDLib has usually already written the first few hundred KB.
+    unawaited(streamSvc.prepareFile(
+      fileId:   fileId,
+      fileSize: fileSize,
+      mimeType: file.mimeType,
     ));
   }
 
@@ -327,7 +321,6 @@ class _FilesScreenState extends State<FilesScreen>
           ],
         ),
         actions: [
-          // Cache size badge + clear button
           if (_cacheSize.isNotEmpty && _cacheSize != '0 B')
             GestureDetector(
               onTap: _clearCache,
@@ -392,7 +385,7 @@ class _FilesScreenState extends State<FilesScreen>
           ),
           child: TextField(
             controller: _searchController,
-            focusNode: _searchFocus,
+            focusNode:  _searchFocus,
             style: const TextStyle(color: Colors.white, fontSize: 14),
             decoration: InputDecoration(
               hintText: 'Search files...',
@@ -410,9 +403,9 @@ class _FilesScreenState extends State<FilesScreen>
                       },
                     )
                   : null,
-              border: InputBorder.none,
-              enabledBorder: InputBorder.none,
-              focusedBorder: InputBorder.none,
+              border:         InputBorder.none,
+              enabledBorder:  InputBorder.none,
+              focusedBorder:  InputBorder.none,
               contentPadding: const EdgeInsets.symmetric(
                   horizontal: 16, vertical: 14),
             ),
@@ -433,13 +426,13 @@ class _FilesScreenState extends State<FilesScreen>
             color: const Color(0xFF2AABEE),
             borderRadius: BorderRadius.circular(8),
           ),
-          indicatorSize: TabBarIndicatorSize.tab,
-          dividerColor: Colors.transparent,
-          labelColor: Colors.white,
-          unselectedLabelColor: const Color(0xFF7070A0),
-          labelStyle: const TextStyle(
+          indicatorSize:          TabBarIndicatorSize.tab,
+          dividerColor:           Colors.transparent,
+          labelColor:             Colors.white,
+          unselectedLabelColor:   const Color(0xFF7070A0),
+          labelStyle:             const TextStyle(
               fontSize: 12, fontWeight: FontWeight.w600),
-          unselectedLabelStyle: const TextStyle(
+          unselectedLabelStyle:   const TextStyle(
               fontSize: 12, fontWeight: FontWeight.w500),
           padding: const EdgeInsets.all(3),
           tabs: _tabs.map((t) => Tab(text: t, height: 32)).toList(),
@@ -447,10 +440,10 @@ class _FilesScreenState extends State<FilesScreen>
       );
 
   Widget _buildBody() {
-    if (_isLoading && !_hasData) return _buildInitialLoading();
+    if (_isLoading && !_hasData)   return _buildInitialLoading();
     if (_loadError != null && !_hasData) return _buildError();
     if (!_isLoading && _allFiles.isEmpty) return _buildEmpty();
-    if (_filtered.isEmpty) return _buildNoResults();
+    if (_filtered.isEmpty)         return _buildNoResults();
     return _buildFileList();
   }
 
@@ -564,9 +557,9 @@ class _FilesScreenState extends State<FilesScreen>
               style: const TextStyle(
                   color: Color(0xFF7070A0), fontSize: 13),
             ),
-            if (_isLoading) ...[
-              const SizedBox(height: 16),
-              const Text('Still scanning — more may appear shortly',
+            if (_isLoading) ...const [
+              SizedBox(height: 16),
+              Text('Still scanning — more may appear shortly',
                   style: TextStyle(
                       color: Color(0xFF5050A0), fontSize: 12)),
             ],
@@ -622,8 +615,7 @@ class _FilesScreenState extends State<FilesScreen>
                         _chip(file.readableDuration,
                             icon: Icons.access_time_rounded),
                       ],
-                      if (file.isVideo &&
-                          file.qualities.isNotEmpty) ...[
+                      if (file.isVideo && file.qualities.isNotEmpty) ...[
                         const SizedBox(width: 6),
                         _chip(file.qualities.first.label,
                             color: const Color(0xFF2AABEE)),
@@ -657,7 +649,7 @@ class _FilesScreenState extends State<FilesScreen>
   }
 
   Widget _buildThumbOrIcon(TelegramFile file) {
-    final icon = _iconFor(file);
+    final icon  = _iconFor(file);
     final color = _colorFor(file);
     if (file.thumbnail != null && file.thumbnail!.isNotEmpty) {
       return ClipRRect(
@@ -709,7 +701,7 @@ class _FilesScreenState extends State<FilesScreen>
     if (file.isVideo) return Icons.movie_rounded;
     if (file.isAudio) return Icons.audio_file_rounded;
     final m = file.mimeType.toLowerCase();
-    if (m.contains('pdf')) return Icons.picture_as_pdf_rounded;
+    if (m.contains('pdf'))   return Icons.picture_as_pdf_rounded;
     if (m.contains('zip') || m.contains('rar') || m.contains('7z')) {
       return Icons.folder_zip_rounded;
     }
@@ -729,7 +721,7 @@ class _FilesScreenState extends State<FilesScreen>
     if (file.isVideo) return const Color(0xFF2AABEE);
     if (file.isAudio) return const Color(0xFF9B59B6);
     final m = file.mimeType.toLowerCase();
-    if (m.contains('pdf')) return const Color(0xFFE74C3C);
+    if (m.contains('pdf'))   return const Color(0xFFE74C3C);
     if (m.contains('zip') || m.contains('rar')) {
       return const Color(0xFFF39C12);
     }
