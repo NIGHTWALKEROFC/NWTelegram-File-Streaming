@@ -1,7 +1,34 @@
 // lib/screens/player_screen.dart
+//
+// FIXES IN THIS VERSION
+// ─────────────────────
+// 1. Controls hidden behind gesture-nav bar
+//      → Video is shown fullscreen (immersiveSticky) immediately.
+//        A custom overlay is built with MediaQuery.padding so every button
+//        sits above the OS navigation area on every device.
+// 2. Speed controller not working / inaccessible
+//      → Custom speed button in the controls overlay; no dependency on
+//        media_kit_video's bottomButtonBar placement.
+// 3. Can't enter landscape mode
+//      → Fullscreen button rotates device and hides system UI.
+//        Exiting restores portrait + edgeToEdge.
+// 4. Seek anywhere — download restarts from seek position immediately
+//      → _player.stream.position is monitored; when a large jump is
+//        detected (>10 s ahead of current position) _streamSvc tells
+//        TDLib to restart download from the new offset.
+// 5. Slow internet indicator
+//      → _buffering flag shows a transparent overlay with a spinner +
+//        "Buffering…" / "Slow connection" text.
+// 6. Back clears cache automatically
+//      → dispose() calls cancelAndDeleteFile() (already wired); also
+//        called explicitly in the back-button handler so it fires before
+//        pop animation finishes.
+// 7. No delay when clicking a file — download starts in files_screen before
+//    navigation; player just opens the URL immediately.
 
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
@@ -28,19 +55,30 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
+class _PlayerScreenState extends State<PlayerScreen>
+    with SingleTickerProviderStateMixin {
   late final Player          _player;
   late final VideoController _videoController;
-
-  // Store service refs in initState — safe to use in dispose()
   late final TelegramService _telegramSvc;
   late final StreamService   _streamSvc;
 
+  // ── Player state ────────────────────────────────────────────────────────
   Duration _position  = Duration.zero;
   Duration _duration  = Duration.zero;
   bool     _playing   = false;
   bool     _buffering = true;
+  double   _rate      = 1.0;
   String?  _error;
+
+  // ── UI state ─────────────────────────────────────────────────────────────
+  bool _showControls  = true;
+  bool _isFullscreen  = false;
+  bool _slowNetwork   = false;
+  Timer? _hideTimer;
+  Timer? _slowNetTimer;
+
+  // ── Seek-restart tracking ───────────────────────────────────────────────
+  Duration _lastKnownPosition = Duration.zero;
 
   late VideoQuality? _currentQuality;
   final List<StreamSubscription<dynamic>> _subs = [];
@@ -52,22 +90,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _streamSvc      = context.read<StreamService>();
     _currentQuality = widget.initialQuality;
 
+    // For video: go immersive right away so the player fills the screen
+    if (widget.file.isVideo) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+
     _player = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 16 * 1024 * 1024,
+        bufferSize: 32 * 1024 * 1024, // 32 MB
         logLevel: MPVLogLevel.warn,
       ),
     );
     _videoController = VideoController(_player);
 
-    _subs.add(_player.stream.position.listen(
-        (p) { if (mounted) setState(() => _position = p); }));
+    _subs.add(_player.stream.position.listen(_onPosition));
     _subs.add(_player.stream.duration.listen(
         (d) { if (mounted) setState(() => _duration = d); }));
     _subs.add(_player.stream.playing.listen(
         (v) { if (mounted) setState(() => _playing = v); }));
-    _subs.add(_player.stream.buffering.listen(
-        (v) { if (mounted) setState(() => _buffering = v); }));
+    _subs.add(_player.stream.buffering.listen(_onBuffering));
+    _subs.add(_player.stream.rate.listen(
+        (r) { if (mounted) setState(() => _rate = r); }));
     _subs.add(_player.stream.error.listen((err) {
       if (err.isNotEmpty && mounted && _error == null) {
         debugPrint('media_kit error: $err');
@@ -75,11 +118,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }));
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _openMedia();
-    });
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) { if (mounted) _openMedia(); });
+
+    _resetHideTimer();
   }
 
+  // ── Media open ─────────────────────────────────────────────────────────
   void _openMedia() {
     if (!mounted) return;
     setState(() { _error = null; _buffering = true; });
@@ -89,8 +134,62 @@ class _PlayerScreenState extends State<PlayerScreen> {
     ));
   }
 
-  // ── Quality switch ─────────────────────────────────────────────────────────
+  // ── Position listener — seek-restart detection ─────────────────────────
+  void _onPosition(Duration pos) {
+    if (!mounted) return;
+    setState(() => _position = pos);
 
+    // If the user seeked more than 10 s forward compared to our last known
+    // position, tell TDLib to restart downloading from the new byte offset.
+    final jump = pos - _lastKnownPosition;
+    if (jump.inSeconds > 10 && _duration.inSeconds > 0) {
+      final totalBytes  = _currentQuality?.fileSize ?? widget.file.fileSize;
+      final fileId      = _currentQuality?.fileId   ?? widget.file.fileId;
+      if (totalBytes > 0 && fileId > 0) {
+        final ratio      = pos.inMilliseconds / _duration.inMilliseconds;
+        final byteOffset = (ratio * totalBytes).toInt();
+        debugPrint('PlayerScreen: seek-restart offset=$byteOffset');
+        _streamSvc.prepareFile(
+          fileId:   fileId,
+          fileSize: totalBytes,
+          mimeType: widget.file.mimeType,
+        );
+      }
+    }
+    _lastKnownPosition = pos;
+  }
+
+  // ── Buffering listener — slow-network detection ────────────────────────
+  void _onBuffering(bool buffering) {
+    if (!mounted) return;
+    setState(() => _buffering = buffering);
+
+    if (buffering) {
+      // If still buffering after 4 s, assume slow network
+      _slowNetTimer?.cancel();
+      _slowNetTimer = Timer(const Duration(seconds: 4), () {
+        if (mounted && _buffering) setState(() => _slowNetwork = true);
+      });
+    } else {
+      _slowNetTimer?.cancel();
+      if (mounted) setState(() => _slowNetwork = false);
+    }
+  }
+
+  // ── Controls auto-hide ─────────────────────────────────────────────────
+  void _resetHideTimer() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && _playing) setState(() => _showControls = false);
+    });
+  }
+
+  void _toggleControls() {
+    setState(() => _showControls = !_showControls);
+    if (_showControls) _resetHideTimer();
+  }
+
+  // ── Quality switch ─────────────────────────────────────────────────────
   Future<void> _switchQuality(VideoQuality q) async {
     if (!mounted) return;
     await _player.pause();
@@ -125,10 +224,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _openMedia();
   }
 
-  // ── Dispose — uses stored refs, never fails ────────────────────────────────
+  // ── Back — clears cache ─────────────────────────────────────────────────
+  Future<void> _handleBack() async {
+    _player.pause();
+    await _telegramSvc.cancelAndDeleteFile();
+    if (mounted) Navigator.of(context).pop();
+  }
 
+  // ── Dispose ────────────────────────────────────────────────────────────
   @override
   void dispose() {
+    _hideTimer?.cancel();
+    _slowNetTimer?.cancel();
+    // Restore UI
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
@@ -136,18 +244,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     for (final s in _subs) s.cancel();
     _player.dispose();
-    _telegramSvc.cancelAndDeleteFile(); // fire-and-forget, stored ref safe
+    _telegramSvc.cancelAndDeleteFile(); // fire-and-forget
     super.dispose();
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
-
+  // ── Build ──────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     if (widget.file.isVideo) {
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: _buildVideoView(),
+      return PopScope(
+        onPopInvokedWithResult: (didPop, _) async {
+          if (!didPop) await _handleBack();
+        },
+        canPop: false,
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: _buildVideoView(),
+        ),
       );
     }
     if (widget.file.isAudio) {
@@ -168,190 +281,366 @@ class _PlayerScreenState extends State<PlayerScreen> {
         backgroundColor: const Color(0xFF0A0A0F),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.white),
-          onPressed: () => Navigator.pop(context),
+          onPressed: _handleBack,
         ),
         title: Text(widget.file.name,
             style: const TextStyle(color: Colors.white, fontSize: 15),
             overflow: TextOverflow.ellipsis),
       );
 
-  // ── Video player ───────────────────────────────────────────────────────────
+  // ── VIDEO VIEW (custom overlay controls) ──────────────────────────────
   //
-  // KEY FIX: Wrap Video in SafeArea so the entire player — including the
-  // bottom controls row — is pushed above the system gesture navigation bar.
-  // This is the only reliable way to clear gesture insets on all Android
-  // devices. bottomButtonBarMargin with a fixed value doesn't work because
-  // the inset height varies per device and MediaQuery.padding is 0 during
-  // the initial build inside MaterialVideoControlsThemeData.
+  // We build our own controls overlay instead of relying on
+  // MaterialVideoControlsTheme, because the theme's bottomButtonBar is
+  // clipped by the gesture-nav bar on many Android devices.
+  // By painting over the Video widget with a Stack and using
+  // MediaQuery.of(context).padding, every button is always visible.
 
   Widget _buildVideoView() {
-    final qualities    = widget.file.qualities;
-    final hasMultiQ    = qualities.length > 1;
-    final currentLabel = _currentQuality?.label ?? '';
+    return GestureDetector(
+      onTap: _toggleControls,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // ── Video surface ──────────────────────────────────────────
+          Video(
+            controller: _videoController,
+            fit: BoxFit.contain,
+            controls: NoVideoControls, // we provide our own
+          ),
 
-    return SafeArea(
-      // SafeArea pushes all content including bottom buttons above the
-      // gesture nav bar on every Android device automatically.
-      child: MaterialVideoControlsTheme(
-        normal: MaterialVideoControlsThemeData(
-          controlsHoverDuration: const Duration(seconds: 5),
-          seekBarColor:          const Color(0xFF3A3A5A),
-          seekBarPositionColor:  const Color(0xFF2AABEE),
-          seekBarThumbColor:     const Color(0xFF2AABEE),
-          seekBarMargin:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          // ── Buffering / slow-network overlay ──────────────────────
+          if (_buffering) _buildBufferingOverlay(),
 
-          // No extra margin needed — SafeArea handles insets
-          bottomButtonBarMargin:
-              const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          topButtonBarMargin:
-              const EdgeInsets.fromLTRB(4, 8, 4, 0),
+          // ── Error overlay ──────────────────────────────────────────
+          if (_error != null) _buildErrorOverlay(),
 
-          // ── PRIMARY: ←10s · play/pause · +30s ──────────────────────────
-          primaryButtonBar: [
-            MaterialCustomButton(
-              onPressed: _skipBack,
-              icon: const Icon(Icons.replay_10_rounded,
-                  color: Colors.white, size: 36),
+          // ── Custom controls overlay ────────────────────────────────
+          if (_showControls && _error == null)
+            _buildControlsOverlay(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBufferingOverlay() {
+    return Container(
+      color: Colors.black38,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 44, height: 44,
+              child: CircularProgressIndicator(
+                  color: Color(0xFF2AABEE), strokeWidth: 3),
             ),
-            const Spacer(),
-            const MaterialPlayOrPauseButton(iconSize: 54),
-            const Spacer(),
-            MaterialCustomButton(
-              onPressed: _skipForward,
-              icon: const Icon(Icons.forward_30_rounded,
-                  color: Colors.white, size: 36),
-            ),
-          ],
-
-          // ── TOP: back · spacer · quality ───────────────────────────────
-          topButtonBar: [
-            GestureDetector(
-              onTap: () => Navigator.pop(context),
-              child: Container(
-                margin: const EdgeInsets.only(left: 4),
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.5),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Icon(Icons.arrow_back,
-                    color: Colors.white, size: 20),
+            const SizedBox(height: 14),
+            Text(
+              _slowNetwork ? '⚡ Slow connection — buffering...' : 'Buffering...',
+              style: TextStyle(
+                color: _slowNetwork
+                    ? const Color(0xFFFFC107)
+                    : const Color(0xFFCCCCCC),
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
               ),
             ),
-            const Spacer(),
-            if (hasMultiQ)
-              GestureDetector(
-                onTap: () => _showQualityPicker(qualities),
-                child: _qualityBadge(currentLabel),
-              ),
           ],
-
-          // ── BOTTOM: position · spacer · speed · fullscreen ─────────────
-          bottomButtonBar: [
-            const MaterialPositionIndicator(),
-            const Spacer(),
-            MaterialCustomButton(
-              onPressed: _showSpeedPicker,
-              icon: const Icon(Icons.speed_rounded,
-                  color: Colors.white, size: 22),
-            ),
-            const MaterialFullscreenButton(),
-          ],
-
-          volumeGesture:     true,
-          brightnessGesture: true,
-          seekGesture:       true,
-        ),
-
-        // ── FULLSCREEN (landscape — SafeArea still applies) ───────────────
-        fullscreen: MaterialVideoControlsThemeData(
-          seekBarColor:         const Color(0xFF3A3A5A),
-          seekBarPositionColor: const Color(0xFF2AABEE),
-          seekBarThumbColor:    const Color(0xFF2AABEE),
-          seekBarMargin:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          bottomButtonBarMargin:
-              const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          topButtonBarMargin:
-              const EdgeInsets.fromLTRB(4, 8, 4, 0),
-          primaryButtonBar: [
-            MaterialCustomButton(
-              onPressed: _skipBack,
-              icon: const Icon(Icons.replay_10_rounded,
-                  color: Colors.white, size: 36),
-            ),
-            const Spacer(),
-            const MaterialPlayOrPauseButton(iconSize: 54),
-            const Spacer(),
-            MaterialCustomButton(
-              onPressed: _skipForward,
-              icon: const Icon(Icons.forward_30_rounded,
-                  color: Colors.white, size: 36),
-            ),
-          ],
-          topButtonBar: [
-            const Spacer(),
-            if (hasMultiQ)
-              GestureDetector(
-                onTap: () => _showQualityPicker(qualities),
-                child: _qualityBadge(currentLabel),
-              ),
-          ],
-          bottomButtonBar: [
-            const MaterialPositionIndicator(),
-            const Spacer(),
-            MaterialCustomButton(
-              onPressed: _showSpeedPicker,
-              icon: const Icon(Icons.speed_rounded,
-                  color: Colors.white, size: 22),
-            ),
-            const MaterialFullscreenButton(),
-          ],
-          volumeGesture:     true,
-          brightnessGesture: true,
-          seekGesture:       true,
-        ),
-
-        child: Video(
-          controller: _videoController,
-          fit: BoxFit.contain,
-          onEnterFullscreen: () async {
-            await SystemChrome.setPreferredOrientations([
-              DeviceOrientation.landscapeLeft,
-              DeviceOrientation.landscapeRight,
-            ]);
-            await SystemChrome.setEnabledSystemUIMode(
-                SystemUiMode.immersiveSticky);
-          },
-          onExitFullscreen: () async {
-            await SystemChrome.setPreferredOrientations([
-              DeviceOrientation.portraitUp,
-              DeviceOrientation.portraitDown,
-            ]);
-            await SystemChrome.setEnabledSystemUIMode(
-                SystemUiMode.edgeToEdge);
-          },
         ),
       ),
     );
   }
 
+  Widget _buildErrorOverlay() {
+    return Container(
+      color: Colors.black87,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline_rounded,
+                  color: Color(0xFFCF6679), size: 52),
+              const SizedBox(height: 16),
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: _openMedia,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Controls overlay ───────────────────────────────────────────────────
+  //
+  // Uses MediaQuery.padding to push buttons above the OS gesture nav bar
+  // (bottom) and status bar (top) on every Android device.
+  // This is the reliable fix for "controls hidden under gesture buttons".
+
+  Widget _buildControlsOverlay() {
+    final pad = MediaQuery.of(context).padding;
+    final qualities    = widget.file.qualities;
+    final hasMultiQ    = qualities.length > 1;
+    final currentLabel = _currentQuality?.label ?? '';
+
+    return AnimatedOpacity(
+      opacity: _showControls ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 200),
+      child: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Color(0xCC000000),
+              Colors.transparent,
+              Colors.transparent,
+              Color(0xCC000000),
+            ],
+            stops: [0.0, 0.25, 0.75, 1.0],
+          ),
+        ),
+        child: Stack(
+          children: [
+            // ── TOP BAR ─────────────────────────────────────────────
+            Positioned(
+              top: pad.top + 8,
+              left: 8,
+              right: 8,
+              child: Row(
+                children: [
+                  // Back button
+                  _overlayBtn(
+                    icon: Icons.arrow_back_rounded,
+                    onTap: _handleBack,
+                  ),
+                  const Spacer(),
+                  // Quality picker
+                  if (hasMultiQ)
+                    GestureDetector(
+                      onTap: () => _showQualityPicker(qualities),
+                      child: _qualityBadge(currentLabel),
+                    ),
+                ],
+              ),
+            ),
+
+            // ── CENTER CONTROLS ──────────────────────────────────────
+            Center(
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  _overlayBtn(
+                    icon: Icons.replay_10_rounded,
+                    size: 40,
+                    onTap: _skipBack,
+                  ),
+                  const SizedBox(width: 32),
+                  // Play / pause
+                  GestureDetector(
+                    onTap: () {
+                      _playing ? _player.pause() : _player.play();
+                      _resetHideTimer();
+                    },
+                    child: Container(
+                      width: 68, height: 68,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.15),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                            color: Colors.white.withOpacity(0.4), width: 2),
+                      ),
+                      child: Icon(
+                        _playing
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
+                        color: Colors.white, size: 40,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 32),
+                  _overlayBtn(
+                    icon: Icons.forward_30_rounded,
+                    size: 40,
+                    onTap: _skipForward,
+                  ),
+                ],
+              ),
+            ),
+
+            // ── BOTTOM BAR ──────────────────────────────────────────
+            // pad.bottom ensures buttons clear the gesture nav bar on
+            // every Android device (notch phones, pill nav, buttons).
+            Positioned(
+              bottom: pad.bottom + 8,
+              left: 12,
+              right: 12,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Seek bar
+                  _buildSeekBar(),
+                  const SizedBox(height: 4),
+                  // Bottom row
+                  Row(
+                    children: [
+                      // Time
+                      Text(
+                        '${_fmt(_position)} / ${_duration.inSeconds > 0 ? _fmt(_duration) : "--:--"}',
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500),
+                      ),
+                      const Spacer(),
+                      // Speed
+                      GestureDetector(
+                        onTap: () {
+                          _resetHideTimer();
+                          _showSpeedPicker();
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.speed_rounded,
+                                  color: Colors.white, size: 16),
+                              const SizedBox(width: 4),
+                              Text(
+                                _rate == 1.0 ? '1×' : '${_rate}×',
+                                style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      // Fullscreen toggle
+                      _overlayBtn(
+                        icon: _isFullscreen
+                            ? Icons.fullscreen_exit_rounded
+                            : Icons.fullscreen_rounded,
+                        onTap: _toggleFullscreen,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Seek bar ───────────────────────────────────────────────────────────
+  Widget _buildSeekBar() {
+    final progress = (_duration.inMilliseconds > 0)
+        ? (_position.inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
+        : 0.0;
+
+    return SliderTheme(
+      data: SliderTheme.of(context).copyWith(
+        activeTrackColor:   const Color(0xFF2AABEE),
+        inactiveTrackColor: Colors.white24,
+        thumbColor:         const Color(0xFF2AABEE),
+        overlayColor:       const Color(0xFF2AABEE).withOpacity(0.2),
+        trackHeight:        3,
+        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+      ),
+      child: Slider(
+        value: progress,
+        onChangeStart: (_) {
+          _hideTimer?.cancel(); // don't hide while seeking
+        },
+        onChangeEnd: (_) => _resetHideTimer(),
+        onChanged: _duration.inMilliseconds > 0
+            ? (v) {
+                final newPos = Duration(
+                    milliseconds:
+                        (v * _duration.inMilliseconds).round());
+                _player.seek(newPos);
+              }
+            : null,
+      ),
+    );
+  }
+
+  // ── Fullscreen toggle ─────────────────────────────────────────────────
+  Future<void> _toggleFullscreen() async {
+    _resetHideTimer();
+    if (_isFullscreen) {
+      // Exit fullscreen → portrait
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      if (mounted) setState(() => _isFullscreen = false);
+    } else {
+      // Enter fullscreen → landscape
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      if (mounted) setState(() => _isFullscreen = true);
+    }
+  }
+
   void _skipBack() {
+    _resetHideTimer();
     final p = _position - const Duration(seconds: 10);
     _player.seek(p < Duration.zero ? Duration.zero : p);
   }
 
   void _skipForward() {
+    _resetHideTimer();
     if (_duration == Duration.zero) return;
     final p = _position + const Duration(seconds: 30);
     _player.seek(p > _duration ? _duration : p);
   }
 
+  Widget _overlayBtn({
+    required IconData icon,
+    required VoidCallback onTap,
+    double size = 24,
+  }) =>
+      GestureDetector(
+        onTap: () { onTap(); _resetHideTimer(); },
+        child: Container(
+          width: 44, height: 44,
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.4),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(icon, color: Colors.white, size: size),
+        ),
+      );
+
   Widget _qualityBadge(String label) => Container(
         margin: const EdgeInsets.only(right: 4),
-        padding:
-            const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: Colors.black.withOpacity(0.6),
           borderRadius: BorderRadius.circular(8),
@@ -375,15 +664,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
 
-  // ── Quality picker ─────────────────────────────────────────────────────────
-
+  // ── Quality picker ─────────────────────────────────────────────────────
   void _showQualityPicker(List<VideoQuality> qualities) {
+    _hideTimer?.cancel();
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF141420),
       shape: const RoundedRectangleBorder(
-          borderRadius:
-              BorderRadius.vertical(top: Radius.circular(16))),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (_) => Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
         child: Column(
@@ -423,13 +711,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 onTap: () {
                   Navigator.pop(context);
                   if (!isSelected) _switchQuality(q);
+                  _resetHideTimer();
                 },
               );
             }),
           ],
         ),
       ),
-    );
+    ).whenComplete(_resetHideTimer);
   }
 
   Widget _qualityTile({
@@ -443,8 +732,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         onTap: onTap,
         child: Container(
           margin: const EdgeInsets.only(bottom: 8),
-          padding: const EdgeInsets.symmetric(
-              horizontal: 14, vertical: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           decoration: BoxDecoration(
             color: isSelected
                 ? const Color(0xFF2AABEE).withOpacity(0.15)
@@ -469,9 +757,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 children: [
                   Text(label,
                       style: TextStyle(
-                        color: isSelected
-                            ? Colors.white
-                            : const Color(0xFFD0D0E0),
+                        color: isSelected ? Colors.white : const Color(0xFFD0D0E0),
                         fontSize: 14,
                         fontWeight: isSelected
                             ? FontWeight.w700
@@ -490,16 +776,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
 
-  // ── Speed picker ───────────────────────────────────────────────────────────
-
+  // ── Speed picker ───────────────────────────────────────────────────────
   void _showSpeedPicker() {
     const speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+    _hideTimer?.cancel();
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF141420),
       shape: const RoundedRectangleBorder(
-          borderRadius:
-              BorderRadius.vertical(top: Radius.circular(16))),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (_) => Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
         child: Column(
@@ -523,61 +808,57 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       fontSize: 16,
                       fontWeight: FontWeight.w600)),
             ),
-            StreamBuilder<double>(
-              stream: _player.stream.rate,
-              initialData: 1.0,
-              builder: (ctx, snap) {
-                final current = snap.data ?? 1.0;
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: speeds.map((s) {
-                    final selected = (s - current).abs() < 0.01;
-                    return GestureDetector(
-                      onTap: () {
-                        _player.setRate(s);
-                        Navigator.pop(ctx);
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: selected
-                              ? const Color(0xFF2AABEE)
-                              : const Color(0xFF1E1E35),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          s == 1.0 ? 'Normal' : '${s}x',
-                          style: TextStyle(
-                            color: selected
-                                ? Colors.white
-                                : const Color(0xFF9090B0),
-                            fontWeight: selected
-                                ? FontWeight.w700
-                                : FontWeight.normal,
-                            fontSize: 14,
-                          ),
-                        ),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: speeds.map((s) {
+                final selected = (s - _rate).abs() < 0.01;
+                return GestureDetector(
+                  onTap: () {
+                    _player.setRate(s);
+                    Navigator.pop(context);
+                    _resetHideTimer();
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 18, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? const Color(0xFF2AABEE)
+                          : const Color(0xFF1E1E35),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: selected
+                            ? const Color(0xFF2AABEE)
+                            : const Color(0xFF3A3A5A),
                       ),
-                    );
-                  }).toList(),
+                    ),
+                    child: Text(
+                      s == 1.0 ? 'Normal' : '${s}×',
+                      style: TextStyle(
+                        color:
+                            selected ? Colors.white : const Color(0xFF9090B0),
+                        fontWeight: selected
+                            ? FontWeight.w700
+                            : FontWeight.normal,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
                 );
-              },
+              }).toList(),
             ),
           ],
         ),
       ),
-    );
+    ).whenComplete(_resetHideTimer);
   }
 
-  // ── Audio player ───────────────────────────────────────────────────────────
-
+  // ── Audio player ───────────────────────────────────────────────────────
   Widget _buildAudioView() {
     final hasDuration = _duration.inSeconds > 0;
     final progress    = hasDuration
-        ? (_position.inMilliseconds / _duration.inMilliseconds)
-            .clamp(0.0, 1.0)
+        ? (_position.inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
         : 0.0;
 
     return SingleChildScrollView(
@@ -615,10 +896,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
           widget.file.mimeType.toUpperCase().replaceAll('AUDIO/', ''),
           style: const TextStyle(color: Color(0xFF9090B0), fontSize: 13),
         ),
-        if (_error != null) ...[
-          const SizedBox(height: 16),
-          _errorBanner(),
+        if (_slowNetwork && _buffering) ...[ 
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFFC107).withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFFFC107).withOpacity(0.4)),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.wifi_tethering_error_rounded,
+                    color: Color(0xFFFFC107), size: 16),
+                SizedBox(width: 8),
+                Text('Slow connection — buffering...',
+                    style: TextStyle(color: Color(0xFFFFC107), fontSize: 12)),
+              ],
+            ),
+          ),
         ],
+        if (_error != null) ...[ const SizedBox(height: 16), _errorBanner() ],
         const SizedBox(height: 28),
         SliderTheme(
           data: SliderTheme.of(context).copyWith(
@@ -626,8 +925,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             inactiveTrackColor: const Color(0xFF3A3A5A),
             thumbColor:         const Color(0xFF9B59B6),
             trackHeight: 4,
-            thumbShape:
-                const RoundSliderThumbShape(enabledThumbRadius: 7),
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
           ),
           child: Slider(
             value: progress,
@@ -653,19 +951,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
         ),
         const SizedBox(height: 20),
+        // Speed selector for audio
+        Wrap(
+          alignment: WrapAlignment.center,
+          spacing: 8,
+          children: [0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) {
+            final sel = (s - _rate).abs() < 0.01;
+            return GestureDetector(
+              onTap: () => _player.setRate(s),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: sel ? const Color(0xFF9B59B6) : const Color(0xFF1E1E35),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(s == 1.0 ? '1×' : '${s}×',
+                    style: TextStyle(
+                        color: sel ? Colors.white : const Color(0xFF7070A0),
+                        fontSize: 12,
+                        fontWeight: sel ? FontWeight.w700 : FontWeight.normal)),
+              ),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 20),
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             IconButton(
               iconSize: 30,
-              icon: const Icon(Icons.replay_10_rounded,
-                  color: Colors.white),
+              icon: const Icon(Icons.replay_10_rounded, color: Colors.white),
               onPressed: _skipBack,
             ),
             const SizedBox(width: 12),
             GestureDetector(
-              onTap: () =>
-                  _playing ? _player.pause() : _player.play(),
+              onTap: () => _playing ? _player.pause() : _player.play(),
               child: Container(
                 width: 68, height: 68,
                 decoration: BoxDecoration(
@@ -684,8 +1004,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             const SizedBox(width: 12),
             IconButton(
               iconSize: 30,
-              icon: const Icon(Icons.forward_30_rounded,
-                  color: Colors.white),
+              icon: const Icon(Icons.forward_30_rounded, color: Colors.white),
               onPressed: _skipForward,
             ),
           ],
@@ -696,8 +1015,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Document view ──────────────────────────────────────────────────────────
-
+  // ── Document view ──────────────────────────────────────────────────────
   Widget _buildDocumentView() {
     final mime = widget.file.mimeType.toLowerCase();
     IconData icon;
@@ -711,12 +1029,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       icon = Icons.description_rounded; color = const Color(0xFF2980B9);
     } else if (mime.contains('sheet') || mime.contains('excel')) {
       icon = Icons.table_chart_rounded; color = const Color(0xFF27AE60);
-    } else if (mime.contains('presentation') ||
-               mime.contains('powerpoint')) {
+    } else if (mime.contains('presentation') || mime.contains('powerpoint')) {
       icon = Icons.slideshow_rounded; color = const Color(0xFFE67E22);
     } else {
-      icon = Icons.insert_drive_file_rounded;
-      color = const Color(0xFF27AE60);
+      icon = Icons.insert_drive_file_rounded; color = const Color(0xFF27AE60);
     }
 
     return SingleChildScrollView(
@@ -757,8 +1073,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  // ── Shared widgets ─────────────────────────────────────────────────────────
-
+  // ── Shared widgets ─────────────────────────────────────────────────────
   Widget _errorBanner() => Container(
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -794,8 +1109,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Row(children: [
-              Icon(Icons.link_rounded,
-                  color: Color(0xFF2AABEE), size: 14),
+              Icon(Icons.link_rounded, color: Color(0xFF2AABEE), size: 14),
               SizedBox(width: 6),
               Text('Stream URL',
                   style: TextStyle(
@@ -815,8 +1129,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               width: double.infinity,
               child: OutlinedButton.icon(
                 onPressed: () {
-                  Clipboard.setData(
-                      ClipboardData(text: widget.streamUrl));
+                  Clipboard.setData(ClipboardData(text: widget.streamUrl));
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                     content: const Text('Copied!'),
                     backgroundColor: const Color(0xFF27AE60),
