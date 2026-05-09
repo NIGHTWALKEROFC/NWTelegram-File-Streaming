@@ -1,4 +1,22 @@
 // lib/services/stream_service.dart
+//
+// Proxy server that serves TDLib-downloaded bytes to libmpv (media_kit).
+//
+// Architecture change vs previous versions:
+// ─────────────────────────────────────────
+// OLD: downloadFile(synchronous:true, limit=512KB) per chunk
+//      → blocks Dart isolate for each chunk
+//      → large files stall, seek resets to start
+//
+// NEW: TDLib downloads the whole file continuously in background (C++ thread).
+//      readFileBytes() polls _activeDownloadPrefix (updated by updateFile events)
+//      and reads from the local file as bytes arrive.
+//      → TDLib downloads at full network speed the whole time
+//      → libmpv reads ahead as fast as data arrives
+//      → seek works: libmpv sends a new Range request, we wait for TDLib to
+//        reach that offset (TDLib automatically prioritises the new range)
+//      → small files: download completes in seconds, play instantly
+//      → large files: play starts after a small buffer, streams continuously
 
 import 'dart:async';
 import 'dart:io';
@@ -11,9 +29,9 @@ import 'package:shelf_router/shelf_router.dart';
 
 import 'telegram_service.dart';
 
-// 512 KB per chunk — large enough for smooth playback, small enough that
-// readFilePart returns within the 90-second timeout on slow connections.
-const int kChunkSize = 512 * 1024;
+// How many bytes to serve per read — small enough to be responsive,
+// large enough for smooth playback.
+const int kChunkSize = 256 * 1024; // 256 KB
 
 const int kProxyPort = 8484;
 
@@ -38,12 +56,11 @@ class StreamService extends ChangeNotifier {
     router.get('/ping', (Request req) => Response.ok('pong'));
     router.get('/stream', _handleStreamRequest);
     router.head('/stream', _handleHeadRequest);
-    router.options('/stream', (Request req) =>
-        Response.ok('', headers: _corsHeaders()));
+    router.options('/stream',
+        (Request req) => Response.ok('', headers: _corsHeaders()));
 
-    final handler = const Pipeline()
-        .addMiddleware(_corsMiddleware())
-        .addHandler(router);
+    final handler =
+        const Pipeline().addMiddleware(_corsMiddleware()).addHandler(router);
 
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -71,17 +88,27 @@ class StreamService extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setActiveFile({
+  // Called by files_screen / player BEFORE opening the player.
+  // Starts background download so TDLib begins fetching immediately.
+  Future<bool> prepareFile({
     required int fileId,
     required int fileSize,
     required String mimeType,
-  }) {
+  }) async {
     _activeFileId = fileId;
     _activeFileSize = fileSize;
     _activeMimeType = mimeType;
+
     debugPrint(
-        'StreamService: active file=$fileId size=$fileSize mime=$mimeType');
+        'StreamService: prepareFile id=$fileId size=$fileSize mime=$mimeType');
+
+    if (_telegramService == null) return false;
+
+    // Start background download — returns path if TDLib accepted the request
+    final path = await _telegramService!.startFileDownload(fileId);
+    debugPrint('StreamService: download started path=$path');
     notifyListeners();
+    return path != null;
   }
 
   // ── HEAD ───────────────────────────────────────────────────────────────────
@@ -101,9 +128,7 @@ class StreamService extends ChangeNotifier {
       'Accept-Ranges': 'bytes',
       'Connection': 'keep-alive',
     };
-    if (fileSize > 0) {
-      headers['Content-Length'] = fileSize.toString();
-    }
+    if (fileSize > 0) headers['Content-Length'] = fileSize.toString();
 
     return Response.ok('', headers: headers);
   }
@@ -122,36 +147,21 @@ class StreamService extends ChangeNotifier {
 
     final rangeHeader = request.headers['range'];
 
-    // Unknown size — stream unbounded (readFilePart returns empty at EOF)
     if (fileSize <= 0) {
-      if (rangeHeader != null) {
-        return Response(416, headers: {'Content-Range': 'bytes */*'});
-      }
       return _buildStreamResponse(
-        start: 0,
-        end: -1,
-        contentLength: -1,
-        fileSize: -1,
-        statusCode: 200,
-      );
+          start: 0, end: -1, contentLength: -1,
+          fileSize: -1, statusCode: 200);
     }
 
-    // No Range header — serve full file
     if (rangeHeader == null) {
       return _buildStreamResponse(
-        start: 0,
-        end: fileSize - 1,
-        contentLength: fileSize,
-        fileSize: fileSize,
-        statusCode: 200,
-      );
+          start: 0, end: fileSize - 1, contentLength: fileSize,
+          fileSize: fileSize, statusCode: 200);
     }
 
-    // Parse Range header
     final range = _parseRange(rangeHeader, fileSize);
     if (range == null) {
-      return Response(416,
-          headers: {'Content-Range': 'bytes */$fileSize'});
+      return Response(416, headers: {'Content-Range': 'bytes */$fileSize'});
     }
 
     final start = range.$1;
@@ -159,12 +169,8 @@ class StreamService extends ChangeNotifier {
     final length = end - start + 1;
 
     return _buildStreamResponse(
-      start: start,
-      end: end,
-      contentLength: length,
-      fileSize: fileSize,
-      statusCode: 206,
-    );
+        start: start, end: end, contentLength: length,
+        fileSize: fileSize, statusCode: 206);
   }
 
   // ── Stream builder ─────────────────────────────────────────────────────────
@@ -184,7 +190,6 @@ class StreamService extends ChangeNotifier {
       'Accept-Ranges': 'bytes',
       'Connection': 'keep-alive',
     };
-
     if (contentLength > 0) {
       headers['Content-Length'] = contentLength.toString();
     }
@@ -197,18 +202,13 @@ class StreamService extends ChangeNotifier {
 
   // ── Chunk fetcher ──────────────────────────────────────────────────────────
   //
-  // downloadFile(synchronous:true) blocks until TDLib has the bytes locally.
+  // Calls readFileBytes() which polls TDLib's downloaded_prefix_size
+  // (updated via updateFile events) and reads from the local file.
   //
-  // Retry logic:
-  //   - null  = hard TDLib error → stop immediately
-  //   - empty at offset=0 = TDLib not ready (CDN auth in progress) → retry
-  //   - empty at offset>0 = seek target not downloaded yet → retry longer
-  //   - empty after max retries = treat as EOF
-  //
-  // Seeking works because libmpv sends a new Range request with the seek
-  // offset. We call downloadFile(offset=seekTarget) which tells TDLib to
-  // start downloading from that point. TDLib cancels the old download and
-  // starts the new one — may take a few seconds for first bytes at new pos.
+  // Because TDLib downloads continuously in the background, readFileBytes()
+  // typically waits only 100-200ms per chunk on a good connection.
+  // On seek, libmpv sends a new Range header with the seek offset.
+  // TDLib auto-prioritises that area of the file.
 
   void _fetchChunks(
     int start,
@@ -225,67 +225,48 @@ class StreamService extends ChangeNotifier {
           if (controller.isClosed) break;
           if (!unbounded && offset > end) break;
 
-          final remaining = unbounded ? kChunkSize : (end - offset + 1);
+          final remaining =
+              unbounded ? kChunkSize : (end - offset + 1);
           final count = remaining.clamp(1, kChunkSize);
 
-          Uint8List? bytes;
-
-          // More retries for seek (non-zero offset) since TDLib must
-          // reposition its download — first chunk after seek can take 10-15s
-          final maxRetries = offset > 0 ? 30 : 12;
-          final retryDelay = offset > 0
-              ? const Duration(milliseconds: 600)
-              : const Duration(milliseconds: 400);
-
-          for (int attempt = 0; attempt < maxRetries; attempt++) {
-            if (controller.isClosed) break;
-            bytes = await _telegramService!.downloadFilePart(
-              fileId: _activeFileId,
-              offset: offset,
-              count: count,
-            );
-            if (bytes == null) break;        // hard error — stop
-            if (bytes.isNotEmpty) break;     // got data — proceed
-            debugPrint(
-                'StreamService: empty at offset=$offset attempt=$attempt/$maxRetries');
-            await Future.delayed(retryDelay);
-          }
+          final Uint8List? bytes = await _telegramService!.readFileBytes(
+            offset: offset,
+            count: count,
+            // Generous timeout — large files on slow connections need time
+            timeoutSeconds: 120,
+          );
 
           if (bytes == null) {
-            debugPrint('StreamService: hard error at offset=$offset');
-            break;
-          }
-          if (bytes.isEmpty) {
-            debugPrint('StreamService: EOF/timeout at offset=$offset');
+            debugPrint(
+                'StreamService: readFileBytes null at offset=$offset (error)');
             break;
           }
 
-          if (!controller.isClosed) {
-            controller.add(bytes);
+          if (bytes.isEmpty) {
+            debugPrint(
+                'StreamService: readFileBytes EOF at offset=$offset');
+            break;
           }
+
+          if (!controller.isClosed) controller.add(bytes);
           offset += bytes.length;
         }
       } catch (e, st) {
         debugPrint('StreamService chunk error: $e\n$st');
       } finally {
-        if (!controller.isClosed) {
-          await controller.close();
-        }
+        if (!controller.isClosed) await controller.close();
       }
     });
   }
+
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   (int, int)? _parseRange(String header, int fileSize) {
     final match = RegExp(r'bytes=(\d*)-(\d*)').firstMatch(header);
     if (match == null) return null;
-
     final startStr = match.group(1) ?? '';
     final endStr = match.group(2) ?? '';
-
-    int start;
-    int end;
-
+    int start, end;
     if (startStr.isEmpty && endStr.isNotEmpty) {
       final suffix = int.tryParse(endStr) ?? 0;
       start = (fileSize - suffix).clamp(0, fileSize - 1);
@@ -296,7 +277,6 @@ class StreamService extends ChangeNotifier {
           ? fileSize - 1
           : int.tryParse(endStr) ?? fileSize - 1;
     }
-
     end = end.clamp(0, fileSize - 1);
     start = start.clamp(0, end);
     return (start, end);
@@ -308,12 +288,10 @@ class StreamService extends ChangeNotifier {
         'Access-Control-Allow-Headers': 'Range, Content-Type',
       };
 
-  Middleware _corsMiddleware() {
-    return (Handler inner) => (Request req) async {
-          final res = await inner(req);
-          return res.change(headers: _corsHeaders());
-        };
-  }
+  Middleware _corsMiddleware() => (Handler inner) => (Request req) async {
+        final res = await inner(req);
+        return res.change(headers: _corsHeaders());
+      };
 
   @override
   void dispose() {
