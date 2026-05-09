@@ -501,7 +501,14 @@ class TelegramService extends ChangeNotifier {
 
       debugPrint(
           'TG.startFileDownload: path=$path prefix=$prefix complete=$complete');
-      return path.isNotEmpty ? path : null;
+
+      // IMPORTANT: with synchronous=false TDLib often returns path='' on the
+      // first response because the local file hasn't been created yet.
+      // The real path arrives via updateFile events shortly after.
+      // As long as TDLib didn't return an error the download IS running —
+      // return a non-null sentinel so prepareFile knows it succeeded.
+      // readFileBytes() polls _activeDownloadPath which updateFile fills in.
+      return 'pending';
     } catch (e) {
       debugPrint('TG.startFileDownload error: $e');
       return null;
@@ -509,11 +516,11 @@ class TelegramService extends ChangeNotifier {
   }
 
   // Read bytes from the locally downloading file.
-  // Waits until the required bytes are available (up to timeoutSeconds).
+  // Polls every 100ms until TDLib has downloaded enough bytes.
   Future<Uint8List?> readFileBytes({
     required int offset,
     required int count,
-    int timeoutSeconds = 60,
+    int timeoutSeconds = 120,
   }) async {
     final fileId = _activeDownloadFileId;
     if (fileId == 0) {
@@ -521,36 +528,44 @@ class TelegramService extends ChangeNotifier {
       return null;
     }
 
-    final deadline =
-        DateTime.now().add(Duration(seconds: timeoutSeconds));
+    final deadline = DateTime.now().add(Duration(seconds: timeoutSeconds));
 
     while (DateTime.now().isBefore(deadline)) {
-      final path = _activeDownloadPath;
-      final prefix = _activeDownloadPrefix;
+      // If download was cancelled/switched while we were waiting, stop
+      if (_activeDownloadFileId != fileId) {
+        debugPrint('TG.readFileBytes: fileId changed, stopping');
+        return null;
+      }
+
+      final path     = _activeDownloadPath;
+      final prefix   = _activeDownloadPrefix;
       final complete = _activeDownloadComplete;
 
-      // Still waiting for the local file to be created by TDLib
+      // Path not yet set — TDLib hasn't created the local file yet.
+      // This is normal for the first 0.5–2 seconds after startFileDownload.
       if (path.isEmpty) {
         await Future.delayed(const Duration(milliseconds: 100));
         continue;
       }
 
-      final needed = offset + count;
-      final available = complete
-          ? await _fileLength(path)
-          : prefix;
+      final needed    = offset + count;
+      final available = complete ? await _fileLength(path) : prefix;
 
+      // Enough bytes downloaded OR file is complete — try to read
       if (available >= needed || complete) {
-        // Enough bytes — read from file
         try {
           final file = io.File(path);
           if (!await file.exists()) {
+            // File was deleted (e.g. quality switch) — stop
             debugPrint('TG.readFileBytes: file missing $path');
             return null;
           }
           final fileLen = await file.length();
+          if (fileLen <= offset) {
+            // Past end of file — real EOF
+            return Uint8List(0);
+          }
           final canRead = (fileLen - offset).clamp(0, count);
-          if (canRead <= 0) return Uint8List(0); // EOF
           final raf = await file.open();
           try {
             await raf.setPosition(offset);
@@ -564,12 +579,11 @@ class TelegramService extends ChangeNotifier {
         }
       }
 
-      // Not enough bytes yet — wait 100ms for TDLib to download more
+      // Not enough bytes yet — TDLib is still downloading, wait
       await Future.delayed(const Duration(milliseconds: 100));
     }
 
-    debugPrint(
-        'TG.readFileBytes timeout at offset=$offset after ${timeoutSeconds}s');
+    debugPrint('TG.readFileBytes: timeout offset=$offset after ${timeoutSeconds}s');
     return null;
   }
 
