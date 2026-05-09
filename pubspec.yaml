@@ -10,22 +10,18 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Telegram TDLib wrapper — actively maintained fork, AGP 8 compatible,
-  # TDLib v1.8.36, correct namespace in android/build.gradle
+  # Telegram TDLib wrapper
   handy_tdlib: ^2.3.10
 
-  # ── Video/Audio player (replaces video_player + chewie) ──────────────────
-  # media_kit uses libmpv/FFmpeg under the hood — same engine as VLC/MPV.
-  # Supports HEVC/H.265, AV1, MKV, TS, FLAC, OPUS, and every other format
-  # ExoPlayer rejects.
+  # Video/Audio player (libmpv/FFmpeg — supports HEVC, MKV, TS, FLAC, OPUS …)
   media_kit: ^1.1.11
   media_kit_video: ^1.2.4
-  media_kit_libs_android_video: ^1.3.4   # FFmpeg native libs for Android
+  media_kit_libs_android_video: ^1.3.4
 
-  # Audio player (kept for audio-only files, lighter than media_kit for audio)
+  # Audio player (lighter for audio-only files)
   just_audio: ^0.9.36
 
-  # Local HTTP proxy server for streaming
+  # Local HTTP proxy server
   shelf: ^1.4.1
   shelf_router: ^1.1.4
 
@@ -41,7 +37,7 @@ dependencies:
   # URL launcher
   url_launcher: ^6.2.4
 
-  # Connectivity
+  # Connectivity — used to detect slow network in player
   connectivity_plus: ^5.0.2
 
   # Loading indicators
