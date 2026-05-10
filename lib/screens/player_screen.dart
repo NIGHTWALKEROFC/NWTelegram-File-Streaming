@@ -66,12 +66,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String?  _error;
 
   // Download-mode state
-  bool   _downloading    = false;
-  double _downloadProgress = 0.0;
+  bool    _downloading      = false;
+  double  _downloadProgress = 0.0;
   String? _localFilePath;
+
+  // Session token captured when this screen starts its download.
+  // Passed back to cancelAndDeleteFile() so a late dispose() of this
+  // screen (after the user already opened a new PlayerScreen) never
+  // deletes the new screen's file.
+  int _myToken = -1;
 
   VideoQuality? _currentQuality;
   final List<StreamSubscription<dynamic>> _subs = [];
+
 
   // Slow-network detection
   bool   _slowNet = false;
@@ -149,6 +156,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       },
     );
 
+    // Capture token AFTER downloadAndWait returns — by then _dlToken has been
+    // incremented for this download. We use this token in dispose() so a late
+    // cleanup of this screen never deletes a newer screen's file.
+    _myToken = _telegramSvc.dlToken;
+
     if (!mounted) return;
 
     if (path == null || path.isEmpty) {
@@ -184,6 +196,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       fileSize: widget.fileSize,
       mimeType: widget.file.mimeType,
     );
+
+    // Capture token so dispose() won't accidentally delete this download
+    _myToken = _telegramSvc.dlToken;
 
     if (!mounted) return;
     if (!ok) {
@@ -236,7 +251,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _handleBack() async {
     _player?.pause();
-    await _telegramSvc.cancelAndDeleteFile();
+    // Pass our token — if a new screen has already started a download,
+    // this is a no-op and the new download is preserved.
+    await _telegramSvc.cancelAndDeleteFile(token: _myToken);
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -251,7 +268,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     for (final s in _subs) s.cancel();
     _player?.dispose();
-    _telegramSvc.cancelAndDeleteFile(); // safety net
+    // Token-guarded: only deletes if no newer download has started.
+    // This prevents the pop-animation dispose from killing a new screen's file.
+    _telegramSvc.cancelAndDeleteFile(token: _myToken);
     super.dispose();
   }
 
