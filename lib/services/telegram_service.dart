@@ -56,12 +56,17 @@ class TelegramService extends ChangeNotifier {
   bool _isLoggedIn      = false;
   bool _isInitialized   = false;
 
-  // ── Active download state (used by proxy for large files) ──────────────────
+  // ── Active download state ──────────────────────────────────────────────────
   int    _dlFileId    = 0;
   String _dlPath      = '';
   int    _dlAbsPrefix = 0;
   bool   _dlComplete  = false;
-  int    _dlFileSize  = 0; // resolved size (may start 0, filled by updateFile)
+  int    _dlFileSize  = 0;
+  // Session token — incremented on every new download.
+  // cancelAndDeleteFile(token) is a no-op when token != _dlToken, so a
+  // late dispose() from the previous PlayerScreen never kills the current
+  // download.
+  int    _dlToken     = 0;
 
   AuthState get authState     => _authState;
   String    get errorMessage  => _errorMessage;
@@ -70,6 +75,9 @@ class TelegramService extends ChangeNotifier {
   int       get dlAbsPrefix   => _dlAbsPrefix;
   bool      get dlComplete    => _dlComplete;
   int       get dlFileSize    => _dlFileSize;
+  // Returns the token issued for the current download. PlayerScreen stores
+  // this at open-time and passes it back to cancelAndDeleteFile().
+  int       get dlToken       => _dlToken;
 
   // ── Initialize ─────────────────────────────────────────────────────────────
 
@@ -433,6 +441,7 @@ class TelegramService extends ChangeNotifier {
   }) async {
     await cancelAndDeleteFile();
 
+    _dlToken    += 1;          // new session — old dispose() tokens are stale
     _dlFileId    = fileId;
     _dlPath      = '';
     _dlAbsPrefix = 0;
@@ -513,6 +522,7 @@ class TelegramService extends ChangeNotifier {
       {int offset = 0, int knownSize = 0}) async {
     await cancelAndDeleteFile();
 
+    _dlToken    += 1;          // new session
     _dlFileId    = fileId;
     _dlPath      = '';
     _dlAbsPrefix = 0;
@@ -521,9 +531,14 @@ class TelegramService extends ChangeNotifier {
 
     debugPrint('TG.startFileDownload fileId=$fileId offset=$offset');
 
-    // Resolve size if unknown
+    // FIX Bug 3: Call getFile first so TDLib registers this file in its local
+    // DB. Without this, readFilePart returns error 400 "file not found" for
+    // large documents that haven't been accessed before in this session.
     if (_dlFileSize <= 0) {
       _dlFileSize = await getFileSize(fileId);
+    } else {
+      // Still call getFile to ensure TDLib has the file registered
+      getFileSize(fileId); // fire-and-forget registration
     }
 
     try {
@@ -641,8 +656,17 @@ class TelegramService extends ChangeNotifier {
 
   // ── Cleanup ────────────────────────────────────────────────────────────────
 
-  Future<void> cancelAndDeleteFile() async {
+  // [token] — if provided, only cancels/deletes if it matches the current
+  // session token. Pass telegramSvc.dlToken (captured at download-start) from
+  // PlayerScreen so that a late dispose() of a previous screen never deletes
+  // the file that the new screen is currently playing.
+  Future<void> cancelAndDeleteFile({int? token}) async {
     if (_dlFileId == 0) return;
+    // Token mismatch means a newer download has already started — don't touch it
+    if (token != null && token != _dlToken) {
+      debugPrint('TG.cancelAndDeleteFile: token mismatch, skipping');
+      return;
+    }
     final fileId = _dlFileId;
     final path   = _dlPath;
 
